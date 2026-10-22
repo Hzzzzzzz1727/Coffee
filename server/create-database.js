@@ -1,0 +1,6 @@
+require('dotenv').config()
+const sql = process.env.DB_AUTH === 'windows' ? require('mssql/msnodesqlv8') : require('mssql')
+const config = { server: process.env.DB_SERVER, port: Number(process.env.DB_PORT || 1433), database: 'master', ...(process.env.DB_AUTH === 'windows' ? { driver:'ODBC Driver 18 for SQL Server' } : { user:process.env.DB_USER, password:process.env.DB_PASSWORD }), options:{ encrypt:process.env.DB_ENCRYPT === 'true', trustServerCertificate:process.env.DB_ENCRYPT !== 'true', ...(process.env.DB_INSTANCE ? { instanceName:process.env.DB_INSTANCE } : {}), ...(process.env.DB_AUTH === 'windows' ? { trustedConnection:true } : {}) } }
+if (process.env.DB_AUTH === 'windows' && process.env.DB_LOCAL_SHARED_MEMORY === 'true') config.connectionString = 'Driver={ODBC Driver 18 for SQL Server};Server=lpc:(local);Database=master;Trusted_Connection=Yes;TrustServerCertificate=Yes;'
+async function run() { const pool = await sql.connect(config); const name = process.env.DB_DATABASE.replace(/]/g, ']]'); await pool.request().query(`IF DB_ID(N'${name}') IS NULL CREATE DATABASE [${name}]`); await pool.close(); console.log(`Database ${process.env.DB_DATABASE} is ready.`) }
+run().catch(err => { console.error(err.message); process.exit(1) })

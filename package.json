@@ -1,0 +1,36 @@
+{
+  "scripts": {
+    "dev": "vite",
+    "dev:lan": "vite --host 0.0.0.0 --port 5173",
+    "server": "node server/index.js",
+    "server:dotnet": "dotnet run --project server-dotnet/CoffeeApi.csproj -c Release --no-build",
+    "prepare:server": "npm run build && dotnet build server-dotnet/CoffeeApi.csproj -c Release",
+    "license:init": "node scripts/generate-license-keys.js",
+    "license:create": "node scripts/create-license-key.js",
+    "package:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1",
+    "package:sqlite-demo": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-sqlite-demo.ps1",
+    "db:migrate": "node server/migrate.js",
+    "db:create": "node server/create-database.js",
+    "db:seed-admin": "node server/seed-admin.js",
+    "db:seed-operational": "node server/seed-operational.js",
+    "db:seed-inventory": "node server/seed-inventory-sample.js",
+    "build": "vite build",
+    "preview": "vite preview",
+    "preview:lan": "vite preview --host 0.0.0.0 --port 4173"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "msnodesqlv8": "^5.4.0",
+    "mssql": "^12.7.2",
+    "pg": "^8.23.0",
+    "vue": "^3.5.42"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.8",
+    "vite": "^8.3.0"
+  }
+}
