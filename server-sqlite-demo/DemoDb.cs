@@ -24,6 +24,8 @@ public static class DemoDb
         await new SqliteCommand(triggerStart<0?schema:schema[..triggerStart],c).ExecuteNonQueryAsync();
         await EnsureColumn(c,"OrderItems","InventoryDeducted","INTEGER NOT NULL DEFAULT 0");
         await EnsureColumn(c,"OrderItems","InventoryDeductedAt","TEXT");
+        await EnsureColumn(c,"Users","AuthVersion","INTEGER NOT NULL DEFAULT 1");
+        await EnsureColumn(c,"Users","DeletedAt","TEXT");
         if(triggerStart>=0)await new SqliteCommand(schema[triggerStart..],c).ExecuteNonQueryAsync();
         if(await ScalarLong(c,"SELECT COUNT(*) FROM Stores")==0)
         {

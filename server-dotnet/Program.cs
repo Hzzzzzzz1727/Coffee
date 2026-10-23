@@ -48,10 +48,13 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJw
 builder.Services.AddAuthorizationBuilder().SetFallbackPolicy(new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build());
 builder.Services.ConfigureHttpJsonOptions(options => options.SerializerOptions.Converters.Add(new UtcDateTimeConverter()));
 var app = builder.Build();
+var productImageDirectory=Environment.GetEnvironmentVariable("COFFEE_UPLOAD_DIR");
+if(string.IsNullOrWhiteSpace(productImageDirectory))productImageDirectory=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"CoffeeOS","uploads","products");
+Directory.CreateDirectory(productImageDirectory);
 await using (var schemaConnection=new SqlConnection(coffeeConnection))
 {
     await schemaConnection.OpenAsync();
-    await new SqlCommand("IF COL_LENGTH('dbo.Products','IsAvailable') IS NULL ALTER TABLE dbo.Products ADD IsAvailable bit NOT NULL CONSTRAINT DF_Products_IsAvailable DEFAULT 1;IF COL_LENGTH('dbo.Orders','BillRequestedAt') IS NULL ALTER TABLE dbo.Orders ADD BillRequestedAt datetime2 NULL;",schemaConnection).ExecuteNonQueryAsync();
+    await new SqlCommand("IF COL_LENGTH('dbo.Products','IsAvailable') IS NULL ALTER TABLE dbo.Products ADD IsAvailable bit NOT NULL CONSTRAINT DF_Products_IsAvailable DEFAULT 1;IF COL_LENGTH('dbo.Products','ImageUrl') IS NULL ALTER TABLE dbo.Products ADD ImageUrl nvarchar(500) NULL;IF COL_LENGTH('dbo.Orders','BillRequestedAt') IS NULL ALTER TABLE dbo.Orders ADD BillRequestedAt datetime2 NULL;IF COL_LENGTH('dbo.Users','AuthVersion') IS NULL ALTER TABLE dbo.Users ADD AuthVersion int NOT NULL CONSTRAINT DF_Users_AuthVersion DEFAULT 1;IF COL_LENGTH('dbo.Users','DeletedAt') IS NULL ALTER TABLE dbo.Users ADD DeletedAt datetime2 NULL;",schemaConnection).ExecuteNonQueryAsync();
     var advancedMigrationPath=Path.Combine(AppContext.BaseDirectory,"migrations","002_advanced_operations.sql");
     if(File.Exists(advancedMigrationPath))await new SqlCommand(await File.ReadAllTextAsync(advancedMigrationPath),schemaConnection).ExecuteNonQueryAsync();
     var layoutMigrationPath=Path.Combine(AppContext.BaseDirectory,"migrations","003_layout_and_license.sql");
@@ -61,6 +64,13 @@ await using (var schemaConnection=new SqlConnection(coffeeConnection))
     {
         var inventorySql=await File.ReadAllTextAsync(inventoryMigrationPath);
         foreach(var batch in Regex.Split(inventorySql,@"^\s*GO\s*$",RegexOptions.Multiline|RegexOptions.IgnoreCase).Where(x=>!string.IsNullOrWhiteSpace(x)))
+            await new SqlCommand(batch,schemaConnection).ExecuteNonQueryAsync();
+    }
+    var managementMigrationPath=Path.Combine(AppContext.BaseDirectory,"migrations","005_management_suite.sql");
+    if(File.Exists(managementMigrationPath))
+    {
+        var managementSql=await File.ReadAllTextAsync(managementMigrationPath);
+        foreach(var batch in Regex.Split(managementSql,@"^\s*GO\s*$",RegexOptions.Multiline|RegexOptions.IgnoreCase).Where(x=>!string.IsNullOrWhiteSpace(x)))
             await new SqlCommand(batch,schemaConnection).ExecuteNonQueryAsync();
     }
 }
@@ -77,7 +87,36 @@ app.Use(async (context,next) =>
     context.Response.StatusCode=402;await context.Response.WriteAsJsonAsync(new{error=license.Message,licenseRequired=true,installationId=license.InstallationId});
 });
 app.UseAuthentication();
+app.Use(async (context,next) =>
+{
+    if(context.User.Identity?.IsAuthenticated!=true||!context.Request.Path.StartsWithSegments("/api")){await next();return;}
+    var idValue=context.User.FindFirstValue(ClaimTypes.NameIdentifier);var versionValue=context.User.FindFirstValue("auth_version");
+    if(!Guid.TryParse(idValue,out var userId)||!int.TryParse(versionValue,out var tokenVersion)){context.Response.StatusCode=401;await context.Response.WriteAsJsonAsync(new{error="Phiên đăng nhập không hợp lệ."});return;}
+    await using var connection=new SqlConnection(coffeeConnection);await connection.OpenAsync();await using var command=new SqlCommand("SELECT IsActive,AuthVersion FROM dbo.Users WHERE Id=@id AND DeletedAt IS NULL",connection);command.Parameters.AddWithValue("@id",userId);await using var reader=await command.ExecuteReaderAsync();
+    if(!await reader.ReadAsync()||!reader.GetBoolean(0)||reader.GetInt32(1)!=tokenVersion){context.Response.StatusCode=401;await context.Response.WriteAsJsonAsync(new{error="Tài khoản đã thay đổi hoặc không còn hoạt động. Vui lòng đăng nhập lại."});return;}
+    await next();
+});
 app.UseAuthorization();
+app.Use(async (context,next) =>
+{
+    var path=context.Request.Path.Value??"";var method=context.Request.Method;string? permission=null;
+    if(method=="POST"&&(path.EndsWith("/mixed-payment")||path.EndsWith("/refund"))&&context.User.FindFirstValue(ClaimTypes.Role)=="cashier")
+    {
+        await using var shiftConnection=new SqlConnection(coffeeConnection);await shiftConnection.OpenAsync();
+        await using var shiftCommand=new SqlCommand("SELECT COUNT(*) FROM dbo.WorkShifts WHERE OpenedBy=@u AND Status='open'",shiftConnection);shiftCommand.Parameters.AddWithValue("@u",Guid.Parse(context.User.FindFirstValue(ClaimTypes.NameIdentifier)!));
+        if(Convert.ToInt32(await shiftCommand.ExecuteScalarAsync())==0){context.Response.StatusCode=409;await context.Response.WriteAsJsonAsync(new{error="Thu ngân phải mở ca trước khi thanh toán hoặc hoàn tiền."});return;}
+    }
+    if(path.StartsWith("/api/users"))permission="staff.manage";
+    else if(path.StartsWith("/api/inventory"))permission="inventory.manage";
+    else if(path.StartsWith("/api/products")||path.StartsWith("/api/categories")||path.StartsWith("/api/product-variants")||path.StartsWith("/api/combos"))permission=method=="GET"?null:"menu.manage";
+    else if(path.StartsWith("/api/reports"))permission="reports.view";
+    else if(path.Contains("/refund"))permission="orders.refund";
+    else if(path.Contains("/pay")||path.Contains("/mixed-payment"))permission="orders.pay";
+    else if(path.StartsWith("/api/orders")&&method=="POST")permission="orders.create";
+    else if(path.StartsWith("/api/order-items")&&method=="DELETE")permission="orders.cancel";
+    if(permission is not null&&await ManagementSuite.ExplicitlyDenied(coffeeConnection,context.User,permission)){context.Response.StatusCode=403;await context.Response.WriteAsJsonAsync(new{error="Tài khoản đã bị tắt quyền thực hiện thao tác này."});return;}
+    await next();
+});
 app.Use(async (context,next) => { var path=context.Request.Path.Value??"";if(path.StartsWith("/api/auth")||path=="/api/health"){await next();return;}var role=context.User.FindFirstValue(ClaimTypes.Role)??"";var method=context.Request.Method;if(path.StartsWith("/api/users")&&role!="owner"){context.Response.StatusCode=403;await context.Response.WriteAsJsonAsync(new{error="Chỉ chủ cửa hàng được quản lý nhân sự."});return;}if(path.StartsWith("/api/products")&&method!="GET"&&!new[]{"owner","manager"}.Contains(role)&&!(role=="barista"&&path.EndsWith("/availability"))){context.Response.StatusCode=403;await context.Response.WriteAsJsonAsync(new{error="Bạn không có quyền sửa menu."});return;}if(path.StartsWith("/api/payment-settings")&&method!="GET"&&!new[]{"owner","manager"}.Contains(role)){context.Response.StatusCode=403;await context.Response.WriteAsJsonAsync(new{error="Bạn không có quyền cấu hình thanh toán."});return;}if(path.StartsWith("/api/reports")&&!new[]{"owner","manager","cashier"}.Contains(role)){context.Response.StatusCode=403;await context.Response.WriteAsJsonAsync(new{error="Bạn không có quyền xem báo cáo."});return;}if(path.Contains("/pay")&&!new[]{"owner","manager","cashier"}.Contains(role)){context.Response.StatusCode=403;await context.Response.WriteAsJsonAsync(new{error="Bạn không có quyền thanh toán."});return;}await next();});
 app.Use(async (context,next) => { var path=context.Request.Path.Value??"";var role=context.User.FindFirstValue(ClaimTypes.Role)??"";var method=context.Request.Method;if(path=="/api/tables"&&method=="POST"&&!new[]{"owner","manager"}.Contains(role)){context.Response.StatusCode=403;await context.Response.WriteAsJsonAsync(new{error="Chỉ chủ quán hoặc quản lý được thêm bàn."});return;}if(path=="/api/orders"&&method=="POST"&&!new[]{"owner","manager","cashier","server"}.Contains(role)){context.Response.StatusCode=403;await context.Response.WriteAsJsonAsync(new{error="Tài khoản pha chế không được tạo đơn."});return;}await next();});
 app.MapGet("/api/health", async () =>
@@ -87,15 +126,23 @@ app.MapGet("/api/health", async () =>
     await using var command = new SqlCommand("SELECT @@SERVERNAME", connection);
     return Results.Ok(new { ok = true, server = (string?)await command.ExecuteScalarAsync() });
 }).AllowAnonymous();
+app.MapGet("/uploads/products/{fileName}",(string fileName)=>
+{
+    var safeName=Path.GetFileName(fileName);var extension=Path.GetExtension(safeName).ToLowerInvariant();
+    if(!string.Equals(fileName,safeName,StringComparison.Ordinal)||!new[]{".jpg",".png",".webp"}.Contains(extension))return Results.NotFound();
+    var path=Path.Combine(productImageDirectory,safeName);if(!File.Exists(path))return Results.NotFound();
+    var contentType=extension==".png"?"image/png":extension==".webp"?"image/webp":"image/jpeg";return Results.File(path,contentType,enableRangeProcessing:true);
+}).AllowAnonymous();
 app.MapPost("/api/auth/login", async (LoginRequest login) =>
 {
+    if(string.IsNullOrWhiteSpace(login.Email)||string.IsNullOrEmpty(login.Password))return Results.Json(new{error="Email hoặc mật khẩu không đúng."},statusCode:401);
     await using var connection = new SqlConnection(coffeeConnection);
     await connection.OpenAsync();
-    await using var command = new SqlCommand("SELECT TOP 1 Id, FullName, Role, PasswordHash FROM dbo.Users WHERE Email=@email AND IsActive=1", connection);
+    await using var command = new SqlCommand("SELECT TOP 1 Id,FullName,Role,PasswordHash,AuthVersion FROM dbo.Users WHERE Email=@email AND IsActive=1 AND DeletedAt IS NULL", connection);
     command.Parameters.AddWithValue("@email", login.Email.Trim().ToLowerInvariant());
     await using var reader = await command.ExecuteReaderAsync();
     if (!await reader.ReadAsync() || !BCrypt.Net.BCrypt.Verify(login.Password, reader.GetString(3))) return Results.Json(new { error="Email hoặc mật khẩu không đúng." }, statusCode:401);
-    var id=reader.GetGuid(0);var name=reader.GetString(1);var role=reader.GetString(2);var claims=new[]{new Claim(ClaimTypes.NameIdentifier,id.ToString()),new Claim(ClaimTypes.Name,name),new Claim(ClaimTypes.Role,role)};var jwt=new JwtSecurityToken("CoffeeOS","CoffeeOS.Client",claims,expires:DateTime.UtcNow.AddHours(8),signingCredentials:new SigningCredentials(new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret)),SecurityAlgorithms.HmacSha256));var token=new JwtSecurityTokenHandler().WriteToken(jwt);return Results.Ok(new { token, user = new { id, name, role } });
+    var id=reader.GetGuid(0);var name=reader.GetString(1);var role=reader.GetString(2);var authVersion=reader.GetInt32(4);var claims=new[]{new Claim(ClaimTypes.NameIdentifier,id.ToString()),new Claim(ClaimTypes.Name,name),new Claim(ClaimTypes.Role,role),new Claim("auth_version",authVersion.ToString())};var jwt=new JwtSecurityToken("CoffeeOS","CoffeeOS.Client",claims,expires:DateTime.UtcNow.AddHours(8),signingCredentials:new SigningCredentials(new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret)),SecurityAlgorithms.HmacSha256));var token=new JwtSecurityTokenHandler().WriteToken(jwt);return Results.Ok(new { token, user = new { id, name, role } });
 }).AllowAnonymous();
 app.MapGet("/api/tables", async () =>
 {
@@ -113,7 +160,7 @@ app.MapPost("/api/tables", async (TableInput input) =>
 });
 app.MapGet("/api/products", async () =>
 {
-    await using var connection = new SqlConnection(coffeeConnection); await connection.OpenAsync(); await using var command = new SqlCommand("SELECT Id,Name,BasePrice AS price,IsAvailable FROM dbo.Products WHERE IsActive=1 ORDER BY Name", connection); await using var reader = await command.ExecuteReaderAsync(); var rows=new List<object>(); while(await reader.ReadAsync()) rows.Add(new { Id=reader.GetGuid(0), Name=reader.GetString(1), price=reader.GetInt32(2), isAvailable=reader.GetBoolean(3) }); return Results.Ok(rows);
+    await using var connection = new SqlConnection(coffeeConnection); await connection.OpenAsync(); await using var command = new SqlCommand("SELECT Id,Name,BasePrice AS price,IsAvailable,ImageUrl,CategoryId,SKU FROM dbo.Products WHERE IsActive=1 ORDER BY Name", connection); await using var reader = await command.ExecuteReaderAsync(); var rows=new List<object>(); while(await reader.ReadAsync()) rows.Add(new { Id=reader.GetGuid(0), Name=reader.GetString(1), price=reader.GetInt32(2), isAvailable=reader.GetBoolean(3),imageUrl=reader.IsDBNull(4)?null:reader.GetString(4),categoryId=reader.GetGuid(5),sku=reader.IsDBNull(6)?"":reader.GetString(6) }); return Results.Ok(rows);
 });
 app.MapPost("/api/products", async (ProductInput product) =>
 {
@@ -123,6 +170,22 @@ app.MapPost("/api/products", async (ProductInput product) =>
 app.MapDelete("/api/products/{id:guid}", async (Guid id) =>
 {
     await using var connection=new SqlConnection(coffeeConnection);await connection.OpenAsync();await using var command=new SqlCommand("UPDATE dbo.Products SET IsActive=0 WHERE Id=@id",connection);command.Parameters.AddWithValue("@id",id);return await command.ExecuteNonQueryAsync()>0?Results.NoContent():Results.NotFound();
+});
+app.MapPost("/api/products/{id:guid}/image", async (Guid id, HttpRequest request) =>
+{
+    if(!request.HasFormContentType)return Results.BadRequest(new{error="Dữ liệu tải lên không hợp lệ."});
+    var form=await request.ReadFormAsync();var file=form.Files.GetFile("image");
+    if(file is null||file.Length==0)return Results.BadRequest(new{error="Hãy chọn một hình ảnh."});
+    if(file.Length>5*1024*1024)return Results.BadRequest(new{error="Ảnh không được lớn hơn 5 MB."});
+    var extensions=new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase){{"image/jpeg",".jpg"},{"image/png",".png"},{"image/webp",".webp"}};
+    if(!extensions.TryGetValue(file.ContentType,out var extension))return Results.BadRequest(new{error="Chỉ hỗ trợ ảnh JPG, PNG hoặc WebP."});
+    if(!await HasValidImageSignature(file,extension))return Results.BadRequest(new{error="Nội dung tệp không phải là hình ảnh hợp lệ."});
+    var fileName=$"{id:N}-{Guid.NewGuid():N}{extension}";var filePath=Path.Combine(productImageDirectory,fileName);var imageUrl=$"/uploads/products/{fileName}";
+    await using(var output=File.Create(filePath))await file.CopyToAsync(output);
+    await using var connection=new SqlConnection(coffeeConnection);await connection.OpenAsync();await using var command=new SqlCommand("UPDATE dbo.Products SET ImageUrl=@url OUTPUT DELETED.ImageUrl WHERE Id=@id AND IsActive=1",connection);command.Parameters.AddWithValue("@url",imageUrl);command.Parameters.AddWithValue("@id",id);var oldUrl=await command.ExecuteScalarAsync();
+    if(oldUrl is null){File.Delete(filePath);return Results.NotFound(new{error="Không tìm thấy món."});}
+    if(oldUrl is string previous&&previous.StartsWith("/uploads/products/",StringComparison.OrdinalIgnoreCase)){var oldPath=Path.Combine(productImageDirectory,Path.GetFileName(previous));if(File.Exists(oldPath))File.Delete(oldPath);}
+    return Results.Ok(new{id,imageUrl});
 });
 app.MapPatch("/api/products/{id:guid}/availability", async (Guid id, AvailabilityInput input, ClaimsPrincipal user) =>
 {
@@ -140,6 +203,7 @@ app.MapPost("/api/orders", async (OrderInput input, ClaimsPrincipal user) =>
         {
             if(item.Quantity<1)throw new Exception("Số lượng không hợp lệ.");
             await using var find=new SqlCommand("SELECT Name,BasePrice FROM dbo.Products WHERE Id=@id AND IsActive=1 AND IsAvailable=1",connection,(SqlTransaction)transaction);find.Parameters.AddWithValue("@id",item.ProductId);await using var reader=await find.ExecuteReaderAsync();if(!await reader.ReadAsync())throw new Exception("Món đã hết hoặc không còn bán.");var name=reader.GetString(0);var price=reader.GetInt32(1);await reader.CloseAsync();
+            if(item.VariantId.HasValue){await using var variantQuery=new SqlCommand("SELECT Name,PriceDelta FROM dbo.ProductVariants WHERE Id=@id AND ProductId=@product AND IsActive=1",connection,(SqlTransaction)transaction);variantQuery.Parameters.AddWithValue("@id",item.VariantId.Value);variantQuery.Parameters.AddWithValue("@product",item.ProductId);await using var variantReader=await variantQuery.ExecuteReaderAsync();if(!await variantReader.ReadAsync())throw new Exception("Size/biến thể không hợp lệ.");name+=$" · {variantReader.GetString(0)}";price+=variantReader.GetInt32(1);await variantReader.CloseAsync();}
             var toppings=new List<(Guid,string,int)>();
             foreach(var selected in item.Toppings??new List<ToppingSelectionInput>())
             {
@@ -205,32 +269,52 @@ app.MapPut("/api/payment-settings", async (PaymentSettingsInput input) =>
 });
 app.MapPost("/api/orders/{id:guid}/pay", async (Guid id, PaymentInput input, ClaimsPrincipal user) =>
 {
-    var methods=new[]{"cash","bank_transfer","card","e_wallet"};if(!methods.Contains(input.Method))return Results.BadRequest(new{error="Phương thức thanh toán không hợp lệ."});var userId=Guid.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);await using var connection=new SqlConnection(coffeeConnection);await connection.OpenAsync();if((user.FindFirstValue(ClaimTypes.Role)??"")=="cashier"){await using var shiftCheck=new SqlCommand("SELECT COUNT(*) FROM dbo.WorkShifts WHERE OpenedBy=@user AND Status='open'",connection);shiftCheck.Parameters.AddWithValue("@user",userId);if((int)(await shiftCheck.ExecuteScalarAsync())!<1)return Results.Conflict(new{error="Thu ngân phải mở ca trước khi nhận thanh toán."});}await using var transaction=await connection.BeginTransactionAsync();await using var find=new SqlCommand("SELECT TableId,Total,CustomerId FROM dbo.Orders WHERE Id=@id AND Status NOT IN ('paid','cancelled')",connection,(SqlTransaction)transaction);find.Parameters.AddWithValue("@id",id);await using var reader=await find.ExecuteReaderAsync();if(!await reader.ReadAsync()){await transaction.RollbackAsync();return Results.NotFound(new{error="Đơn đã đóng hoặc không tồn tại."});}var tableId=reader.GetGuid(0);var amount=reader.GetInt32(1);var customerId=reader.IsDBNull(2)?(Guid?)null:reader.GetGuid(2);await reader.CloseAsync();await using var command=new SqlCommand("DECLARE @shift uniqueidentifier=(SELECT TOP 1 Id FROM dbo.WorkShifts WHERE OpenedBy=@user AND Status='open' ORDER BY OpenedAt DESC);INSERT dbo.Payments(OrderId,Amount,Method,Reference,ReceivedBy)VALUES(@id,@amount,@method,@reference,@user);UPDATE dbo.Orders SET Status='paid',ClosedAt=SYSUTCDATETIME(),ClosedBy=@user,ShiftId=@shift WHERE Id=@id;UPDATE dbo.OrderItems SET Status='paid' WHERE OrderId=@id AND Status<>'cancelled';UPDATE dbo.DiningTables SET Status=CASE WHEN EXISTS(SELECT 1 FROM dbo.Orders WHERE TableId=@table AND Status NOT IN ('paid','cancelled') AND Id<>@id) THEN 'occupied' ELSE 'available' END WHERE Id=@table;IF @customer IS NOT NULL UPDATE dbo.Customers SET TotalSpent=TotalSpent+@amount,Points=Points+(@amount/10000) WHERE Id=@customer",connection,(SqlTransaction)transaction);command.Parameters.AddWithValue("@id",id);command.Parameters.AddWithValue("@amount",amount);command.Parameters.AddWithValue("@method",input.Method);command.Parameters.AddWithValue("@reference",(object?)input.Reference??DBNull.Value);command.Parameters.AddWithValue("@table",tableId);command.Parameters.AddWithValue("@user",userId);command.Parameters.AddWithValue("@customer",(object?)customerId??DBNull.Value);await command.ExecuteNonQueryAsync();await transaction.CommitAsync();if(input.Method=="cash")await ReceiptPrinter.TryOpenDrawer(coffeeConnection);return Results.Ok(new{id,amount,earnedPoints=customerId.HasValue?amount/10000:0,method=input.Method,paidAt=DateTime.UtcNow});
+    var methods=new[]{"cash","bank_transfer","card","e_wallet"};if(!methods.Contains(input.Method))return Results.BadRequest(new{error="Phương thức thanh toán không hợp lệ."});var userId=Guid.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);await using var connection=new SqlConnection(coffeeConnection);await connection.OpenAsync();if((user.FindFirstValue(ClaimTypes.Role)??"")=="cashier"){await using var shiftCheck=new SqlCommand("SELECT COUNT(*) FROM dbo.WorkShifts WHERE OpenedBy=@user AND Status='open'",connection);shiftCheck.Parameters.AddWithValue("@user",userId);if((int)(await shiftCheck.ExecuteScalarAsync())!<1)return Results.Conflict(new{error="Thu ngân phải mở ca trước khi nhận thanh toán."});}await using var transaction=await connection.BeginTransactionAsync();await using var find=new SqlCommand("SELECT TableId,Total,CustomerId FROM dbo.Orders WHERE Id=@id AND Status NOT IN ('paid','cancelled')",connection,(SqlTransaction)transaction);find.Parameters.AddWithValue("@id",id);await using var reader=await find.ExecuteReaderAsync();if(!await reader.ReadAsync()){await transaction.RollbackAsync();return Results.NotFound(new{error="Đơn đã đóng hoặc không tồn tại."});}var tableId=reader.IsDBNull(0)?(Guid?)null:reader.GetGuid(0);var amount=reader.GetInt32(1);var customerId=reader.IsDBNull(2)?(Guid?)null:reader.GetGuid(2);await reader.CloseAsync();await using var command=new SqlCommand("DECLARE @shift uniqueidentifier=(SELECT TOP 1 Id FROM dbo.WorkShifts WHERE OpenedBy=@user AND Status='open' ORDER BY OpenedAt DESC);INSERT dbo.Payments(OrderId,Amount,Method,Reference,ReceivedBy)VALUES(@id,@amount,@method,@reference,@user);UPDATE dbo.Orders SET Status='paid',ClosedAt=SYSUTCDATETIME(),ClosedBy=@user,ShiftId=@shift WHERE Id=@id;UPDATE dbo.OrderItems SET Status='paid' WHERE OrderId=@id AND Status<>'cancelled';UPDATE dbo.DiningTables SET Status=CASE WHEN EXISTS(SELECT 1 FROM dbo.Orders WHERE TableId=@table AND Status NOT IN ('paid','cancelled') AND Id<>@id) THEN 'occupied' ELSE 'available' END WHERE Id=@table;INSERT dbo.PromotionUsages(PromotionId,OrderId,CustomerId) SELECT PromotionId,Id,CustomerId FROM dbo.Orders WHERE Id=@id AND PromotionId IS NOT NULL AND NOT EXISTS(SELECT 1 FROM dbo.PromotionUsages WHERE OrderId=@id);IF @customer IS NOT NULL BEGIN UPDATE dbo.Customers SET TotalSpent=TotalSpent+@amount,Points=Points+(@amount/10000) WHERE Id=@customer;INSERT dbo.CustomerPointTransactions(CustomerId,OrderId,Points,Reason)VALUES(@customer,@id,@amount/10000,N'Tích điểm từ thanh toán') END",connection,(SqlTransaction)transaction);command.Parameters.AddWithValue("@id",id);command.Parameters.AddWithValue("@amount",amount);command.Parameters.AddWithValue("@method",input.Method);command.Parameters.AddWithValue("@reference",(object?)input.Reference??DBNull.Value);command.Parameters.AddWithValue("@table",(object?)tableId??DBNull.Value);command.Parameters.AddWithValue("@user",userId);command.Parameters.AddWithValue("@customer",(object?)customerId??DBNull.Value);await command.ExecuteNonQueryAsync();await transaction.CommitAsync();if(input.Method=="cash")await ReceiptPrinter.TryOpenDrawer(coffeeConnection);return Results.Ok(new{id,amount,earnedPoints=customerId.HasValue?amount/10000:0,method=input.Method,paidAt=DateTime.UtcNow});
 });
 app.MapGet("/api/users", async () =>
 {
-    await using var connection=new SqlConnection(coffeeConnection);await connection.OpenAsync();await using var command=new SqlCommand("SELECT Id,FullName,Email,Role,IsActive,CreatedAt FROM dbo.Users ORDER BY CreatedAt",connection);await using var reader=await command.ExecuteReaderAsync();var rows=new List<object>();while(await reader.ReadAsync())rows.Add(new{id=reader.GetGuid(0),name=reader.GetString(1),email=reader.GetString(2),role=reader.GetString(3),isActive=reader.GetBoolean(4),createdAt=reader.GetDateTime(5)});return Results.Ok(rows);
+    await using var connection=new SqlConnection(coffeeConnection);await connection.OpenAsync();await using var command=new SqlCommand("SELECT Id,FullName,Email,Role,IsActive,CreatedAt FROM dbo.Users WHERE DeletedAt IS NULL ORDER BY CASE Role WHEN 'owner' THEN 0 WHEN 'manager' THEN 1 ELSE 2 END,CreatedAt",connection);await using var reader=await command.ExecuteReaderAsync();var rows=new List<object>();while(await reader.ReadAsync())rows.Add(new{id=reader.GetGuid(0),name=reader.GetString(1),email=reader.GetString(2),role=reader.GetString(3),isActive=reader.GetBoolean(4),createdAt=reader.GetDateTime(5)});return Results.Ok(rows);
 });
 app.MapPost("/api/users", async (UserInput input) =>
 {
-    var roles=new[]{"owner","manager","cashier","server","barista"};if(!roles.Contains(input.Role)||string.IsNullOrWhiteSpace(input.Email)||input.Password.Length<8)return Results.BadRequest(new{error="Thông tin nhân viên không hợp lệ."});await using var connection=new SqlConnection(coffeeConnection);await connection.OpenAsync();var store=(Guid)(await new SqlCommand("SELECT TOP 1 Id FROM dbo.Stores",connection).ExecuteScalarAsync())!;await using var command=new SqlCommand("INSERT dbo.Users(StoreId,FullName,Email,PasswordHash,Role) OUTPUT INSERTED.Id VALUES(@s,@n,@e,@p,@r)",connection);command.Parameters.AddWithValue("@s",store);command.Parameters.AddWithValue("@n",input.Name);command.Parameters.AddWithValue("@e",input.Email.ToLowerInvariant());command.Parameters.AddWithValue("@p",BCrypt.Net.BCrypt.HashPassword(input.Password,12));command.Parameters.AddWithValue("@r",input.Role);try{return Results.Ok(new{id=(Guid)(await command.ExecuteScalarAsync())!});}catch(SqlException){return Results.Conflict(new{error="Email đã tồn tại."});}
+    var roles=new[]{"manager","cashier","server","barista"};if(!roles.Contains(input.Role??"")||string.IsNullOrWhiteSpace(input.Name)||string.IsNullOrWhiteSpace(input.Email)||!System.Net.Mail.MailAddress.TryCreate(input.Email.Trim(),out _)||string.IsNullOrEmpty(input.Password)||input.Password.Length<8)return Results.BadRequest(new{error="Tên, email, mật khẩu hoặc vai trò không hợp lệ."});await using var connection=new SqlConnection(coffeeConnection);await connection.OpenAsync();var store=(Guid)(await new SqlCommand("SELECT TOP 1 Id FROM dbo.Stores",connection).ExecuteScalarAsync())!;await using var command=new SqlCommand("INSERT dbo.Users(StoreId,FullName,Email,PasswordHash,Role) OUTPUT INSERTED.Id VALUES(@s,@n,@e,@p,@r)",connection);command.Parameters.AddWithValue("@s",store);command.Parameters.AddWithValue("@n",input.Name.Trim());command.Parameters.AddWithValue("@e",input.Email.Trim().ToLowerInvariant());command.Parameters.AddWithValue("@p",BCrypt.Net.BCrypt.HashPassword(input.Password,12));command.Parameters.AddWithValue("@r",input.Role);try{return Results.Ok(new{id=(Guid)(await command.ExecuteScalarAsync())!});}catch(SqlException){return Results.Conflict(new{error="Email đã tồn tại."});}
 });
+app.MapPut("/api/users/{id:guid}",async(Guid id,UserUpdateInput input,ClaimsPrincipal user)=>{var roles=new[]{"manager","cashier","server","barista"};if(string.IsNullOrWhiteSpace(input.Name)||string.IsNullOrWhiteSpace(input.Email)||string.IsNullOrWhiteSpace(input.Role)||!System.Net.Mail.MailAddress.TryCreate(input.Email.Trim(),out _))return Results.BadRequest(new{error="Tên hoặc email không hợp lệ."});var actor=Guid.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);await using var connection=new SqlConnection(coffeeConnection);await connection.OpenAsync();await using var find=new SqlCommand("SELECT Role FROM dbo.Users WHERE Id=@id AND DeletedAt IS NULL",connection);find.Parameters.AddWithValue("@id",id);var oldRole=(string?)await find.ExecuteScalarAsync();if(oldRole is null)return Results.NotFound(new{error="Không tìm thấy tài khoản."});if((oldRole=="owner"&&input.Role!="owner")||(oldRole!="owner"&&!roles.Contains(input.Role)))return Results.BadRequest(new{error="Vai trò không hợp lệ."});if(actor==id&&input.Role!=oldRole)return Results.BadRequest(new{error="Bạn không thể tự thay đổi vai trò của mình."});await using var command=new SqlCommand("UPDATE dbo.Users SET FullName=@n,Email=@e,Role=@r,AuthVersion=AuthVersion+CASE WHEN Role<>@r THEN 1 ELSE 0 END WHERE Id=@id AND DeletedAt IS NULL",connection);command.Parameters.AddWithValue("@n",input.Name.Trim());command.Parameters.AddWithValue("@e",input.Email.Trim().ToLowerInvariant());command.Parameters.AddWithValue("@r",input.Role);command.Parameters.AddWithValue("@id",id);try{await command.ExecuteNonQueryAsync();return Results.Ok(new{id,name=input.Name.Trim(),email=input.Email.Trim().ToLowerInvariant(),role=input.Role});}catch(SqlException){return Results.Conflict(new{error="Email đã được tài khoản khác sử dụng."});}});
+app.MapPatch("/api/users/{id:guid}/status",async(Guid id,UserStatusInput input,ClaimsPrincipal user)=>{var actor=Guid.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);if(actor==id)return Results.BadRequest(new{error="Bạn không thể tự khóa tài khoản đang đăng nhập."});await using var connection=new SqlConnection(coffeeConnection);await connection.OpenAsync();await using var command=new SqlCommand("UPDATE dbo.Users SET IsActive=@active,AuthVersion=AuthVersion+1 WHERE Id=@id AND DeletedAt IS NULL AND Role<>'owner'",connection);command.Parameters.AddWithValue("@active",input.IsActive);command.Parameters.AddWithValue("@id",id);return await command.ExecuteNonQueryAsync()>0?Results.Ok(new{id,isActive=input.IsActive}):Results.BadRequest(new{error="Không thể thay đổi trạng thái tài khoản chủ cửa hàng."});});
+app.MapPatch("/api/users/{id:guid}/password",async(Guid id,UserPasswordInput input)=>{if(string.IsNullOrEmpty(input.Password)||input.Password.Length<8)return Results.BadRequest(new{error="Mật khẩu phải có ít nhất 8 ký tự."});await using var connection=new SqlConnection(coffeeConnection);await connection.OpenAsync();await using var command=new SqlCommand("UPDATE dbo.Users SET PasswordHash=@p,AuthVersion=AuthVersion+1 WHERE Id=@id AND DeletedAt IS NULL",connection);command.Parameters.AddWithValue("@p",BCrypt.Net.BCrypt.HashPassword(input.Password,12));command.Parameters.AddWithValue("@id",id);return await command.ExecuteNonQueryAsync()>0?Results.Ok(new{id}):Results.NotFound(new{error="Không tìm thấy tài khoản."});});
+app.MapDelete("/api/users/{id:guid}",async(Guid id,ClaimsPrincipal user)=>{var actor=Guid.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);if(actor==id)return Results.BadRequest(new{error="Bạn không thể tự xóa tài khoản đang đăng nhập."});await using var connection=new SqlConnection(coffeeConnection);await connection.OpenAsync();await using var command=new SqlCommand("UPDATE dbo.Users SET IsActive=0,DeletedAt=SYSUTCDATETIME(),AuthVersion=AuthVersion+1 WHERE Id=@id AND DeletedAt IS NULL AND Role<>'owner'",connection);command.Parameters.AddWithValue("@id",id);return await command.ExecuteNonQueryAsync()>0?Results.Ok(new{id,archived=true}):Results.BadRequest(new{error="Không thể xóa tài khoản chủ cửa hàng."});});
 app.MapAdvancedFeatures(coffeeConnection);
 app.MapInventoryFeatures(coffeeConnection);
+app.MapManagementSuite(coffeeConnection);
 app.MapPrinterEndpoints(coffeeConnection);
 app.MapWebPushFeatures(coffeeConnection);
 app.MapLicenseFeatures(coffeeConnection);
 app.MapFallbackToFile("index.html").AllowAnonymous();
 app.Run("http://0.0.0.0:3032");
 
+static async Task<bool> HasValidImageSignature(IFormFile file,string extension)
+{
+    var header=new byte[12];await using var stream=file.OpenReadStream();var read=await stream.ReadAsync(header);
+    return extension switch
+    {
+        ".jpg"=>read>=3&&header[0]==0xff&&header[1]==0xd8&&header[2]==0xff,
+        ".png"=>read>=8&&header.AsSpan(0,8).SequenceEqual(new byte[]{0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a}),
+        ".webp"=>read>=12&&header.AsSpan(0,4).SequenceEqual("RIFF"u8)&&header.AsSpan(8,4).SequenceEqual("WEBP"u8),
+        _=>false
+    };
+}
+
 record LoginRequest(string Email, string Password);
 record ProductInput(string Name, int Price);
 record OrderInput(Guid TableId, List<OrderItemInput> Items);
-record OrderItemInput(Guid ProductId, int Quantity, string? Note, List<ToppingSelectionInput>? Toppings);
+record OrderItemInput(Guid ProductId, int Quantity, string? Note, List<ToppingSelectionInput>? Toppings, Guid? VariantId=null);
 record ToppingSelectionInput(Guid ToppingId);
 record TableInput(string Name, int Seats, Guid? AreaId=null, string Shape="rectangle");
 record StatusInput(string Status, string? Reason = null);
 record UserInput(string Name, string Email, string Password, string Role);
+record UserUpdateInput(string Name,string Email,string Role);
+record UserStatusInput(bool IsActive);
+record UserPasswordInput(string Password);
 record PaymentSettingsInput(string BankId, string AccountNumber, string AccountName);
 record PaymentInput(string Method, string? Reference);
 record AvailabilityInput(bool IsAvailable);
