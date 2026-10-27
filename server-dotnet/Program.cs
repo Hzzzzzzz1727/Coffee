@@ -1,6 +1,7 @@
 using Microsoft.Data.SqlClient;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
@@ -9,11 +10,27 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using System.Threading.RateLimiting;
 
+DotEnvLoader.Load();
 var builder = WebApplication.CreateBuilder(args);
-var connectionString = "Server=127.0.0.1,1433;Database=master;Integrated Security=True;TrustServerCertificate=True;Encrypt=False;";
-var coffeeConnection = connectionString.Replace("Database=master", "Database=CoffeeOS");
+var sqlConnectionString = Environment.GetEnvironmentVariable("COFFEE_SQL_CONNECTION_STRING");
+var sqlConnectionBuilder = string.IsNullOrWhiteSpace(sqlConnectionString)
+    ? new SqlConnectionStringBuilder
+    {
+        DataSource = "127.0.0.1,1433",
+        InitialCatalog = "master",
+        IntegratedSecurity = true,
+        TrustServerCertificate = true,
+        Encrypt = false
+    }
+    : new SqlConnectionStringBuilder(sqlConnectionString);
+sqlConnectionBuilder.InitialCatalog = "master";
+var connectionString = sqlConnectionBuilder.ConnectionString;
+sqlConnectionBuilder.InitialCatalog = "CoffeeOS";
+var coffeeConnection = sqlConnectionBuilder.ConnectionString;
 var jwtSecret = Environment.GetEnvironmentVariable("COFFEE_JWT_SECRET");
+var googleClientId = Environment.GetEnvironmentVariable("GOOGLE_CLIENT_ID")?.Trim() ?? "";
 if(string.IsNullOrWhiteSpace(jwtSecret))
 {
     var localData=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"CoffeeOS");
@@ -30,7 +47,7 @@ if (args.Length >= 3 && args[0] == "--setup")
 {
     var email = args[1].ToLowerInvariant(); var password = args[2]; var name = args.Length > 3 ? string.Join(' ', args.Skip(3)) : "Chủ cửa hàng";
     await using (var master = new SqlConnection(connectionString)) { await master.OpenAsync(); await new SqlCommand("IF DB_ID(N'CoffeeOS') IS NULL CREATE DATABASE CoffeeOS", master).ExecuteNonQueryAsync(); }
-    var appConnection = connectionString.Replace("Database=master", "Database=CoffeeOS");
+    var appConnection = coffeeConnection;
     await using var database = new SqlConnection(appConnection); await database.OpenAsync();
     var migration = await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "migrations", "001_initial.sql"));
     await new SqlCommand(migration, database).ExecuteNonQueryAsync();
@@ -46,6 +63,43 @@ if (args.Length >= 3 && args[0] == "--setup")
 builder.Services.AddCors(options => options.AddDefaultPolicy(policy => policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer(options => options.TokenValidationParameters = new TokenValidationParameters { ValidateIssuer=true,ValidateAudience=true,ValidateLifetime=true,ValidateIssuerSigningKey=true,ValidIssuer="CoffeeOS",ValidAudience="CoffeeOS.Client",IssuerSigningKey=new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret)),ClockSkew=TimeSpan.FromMinutes(1) });
 builder.Services.AddAuthorizationBuilder().SetFallbackPolicy(new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build());
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.OnRejected = async (context, cancellationToken) =>
+    {
+        await context.HttpContext.Response.WriteAsJsonAsync(
+            new { error = "Bạn đã thử quá nhiều lần. Hãy đợi vài phút rồi thử lại." },
+            cancellationToken: cancellationToken);
+    };
+    options.AddPolicy("auth", context => RateLimitPartition.GetFixedWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 100,
+            Window = TimeSpan.FromMinutes(10),
+            QueueLimit = 0,
+            AutoReplenishment = true
+        }));
+    options.AddPolicy("password-reset", context => RateLimitPartition.GetFixedWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 5,
+            Window = TimeSpan.FromMinutes(15),
+            QueueLimit = 0,
+            AutoReplenishment = true
+        }));
+    options.AddPolicy("registration", context => RateLimitPartition.GetFixedWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 5,
+            Window = TimeSpan.FromMinutes(15),
+            QueueLimit = 0,
+            AutoReplenishment = true
+        }));
+});
 builder.Services.ConfigureHttpJsonOptions(options => options.SerializerOptions.Converters.Add(new UtcDateTimeConverter()));
 var app = builder.Build();
 var productImageDirectory=Environment.GetEnvironmentVariable("COFFEE_UPLOAD_DIR");
@@ -74,10 +128,12 @@ await using (var schemaConnection=new SqlConnection(coffeeConnection))
             await new SqlCommand(batch,schemaConnection).ExecuteNonQueryAsync();
     }
 }
+await AuthFeatures.InitializeAsync(coffeeConnection);
 await LicenseFeatures.EnsureInstallation(coffeeConnection);
 app.UseDefaultFiles();
 app.UseStaticFiles();
 app.UseCors();
+app.UseRateLimiter();
 app.Use(async (context,next) =>
 {
     var path=context.Request.Path.Value??"";
@@ -133,17 +189,11 @@ app.MapGet("/uploads/products/{fileName}",(string fileName)=>
     var path=Path.Combine(productImageDirectory,safeName);if(!File.Exists(path))return Results.NotFound();
     var contentType=extension==".png"?"image/png":extension==".webp"?"image/webp":"image/jpeg";return Results.File(path,contentType,enableRangeProcessing:true);
 }).AllowAnonymous();
-app.MapPost("/api/auth/login", async (LoginRequest login) =>
-{
-    if(string.IsNullOrWhiteSpace(login.Email)||string.IsNullOrEmpty(login.Password))return Results.Json(new{error="Email hoặc mật khẩu không đúng."},statusCode:401);
-    await using var connection = new SqlConnection(coffeeConnection);
-    await connection.OpenAsync();
-    await using var command = new SqlCommand("SELECT TOP 1 Id,FullName,Role,PasswordHash,AuthVersion FROM dbo.Users WHERE Email=@email AND IsActive=1 AND DeletedAt IS NULL", connection);
-    command.Parameters.AddWithValue("@email", login.Email.Trim().ToLowerInvariant());
-    await using var reader = await command.ExecuteReaderAsync();
-    if (!await reader.ReadAsync() || !BCrypt.Net.BCrypt.Verify(login.Password, reader.GetString(3))) return Results.Json(new { error="Email hoặc mật khẩu không đúng." }, statusCode:401);
-    var id=reader.GetGuid(0);var name=reader.GetString(1);var role=reader.GetString(2);var authVersion=reader.GetInt32(4);var claims=new[]{new Claim(ClaimTypes.NameIdentifier,id.ToString()),new Claim(ClaimTypes.Name,name),new Claim(ClaimTypes.Role,role),new Claim("auth_version",authVersion.ToString())};var jwt=new JwtSecurityToken("CoffeeOS","CoffeeOS.Client",claims,expires:DateTime.UtcNow.AddHours(8),signingCredentials:new SigningCredentials(new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret)),SecurityAlgorithms.HmacSha256));var token=new JwtSecurityTokenHandler().WriteToken(jwt);return Results.Ok(new { token, user = new { id, name, role } });
-}).AllowAnonymous();
+var allowRegistration = string.Equals(
+    Environment.GetEnvironmentVariable("COFFEE_ALLOW_REGISTRATION")?.Trim(),
+    "true",
+    StringComparison.OrdinalIgnoreCase);
+AuthFeatures.Map(app, coffeeConnection, jwtSecret, googleClientId, allowRegistration);
 app.MapGet("/api/tables", async () =>
 {
     await using var connection = new SqlConnection(coffeeConnection); await connection.OpenAsync();
@@ -304,7 +354,6 @@ static async Task<bool> HasValidImageSignature(IFormFile file,string extension)
     };
 }
 
-record LoginRequest(string Email, string Password);
 record ProductInput(string Name, int Price);
 record OrderInput(Guid TableId, List<OrderItemInput> Items);
 record OrderItemInput(Guid ProductId, int Quantity, string? Note, List<ToppingSelectionInput>? Toppings, Guid? VariantId=null);

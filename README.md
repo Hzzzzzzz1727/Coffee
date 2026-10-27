@@ -15,9 +15,39 @@ Backend đang sử dụng chính là **ASP.NET Core .NET 10** trong `server-dotn
 
 API chạy mặc định ở `http://localhost:3031`; endpoint kiểm tra là `GET /api/health`.
 
+## Quên mật khẩu và đăng nhập Google
+
+- Quên mật khẩu gửi mã OTP 6 số tới email đã đăng ký; mã hết hạn sau 10 phút và tối đa 5 lần nhập sai. Đặt lại mật khẩu sẽ đăng xuất các phiên hiện tại.
+- Đăng nhập Google chỉ dành cho email đã được chủ quán tạo trong Coffee OS. Lần đăng nhập Google đầu tiên liên kết tài khoản theo email Google đã xác minh; không tự tạo tài khoản nhân viên mới.
+- Tự đăng ký tài khoản bị tắt mặc định. Để bật, thêm `COFFEE_ALLOW_REGISTRATION=true` vào `.env` hoặc Windows Environment Variables trên máy chủ rồi khởi động lại CoffeeOS. Tài khoản đăng ký được gán quyền Phục vụ; API giới hạn tối đa 5 lượt đăng ký mỗi địa chỉ IP trong 15 phút. Để tắt lại, đặt biến thành `false` hoặc xóa biến.
+- Tạo OAuth Client ID loại **Web application** trong Google Cloud Console và thêm địa chỉ website vào **Authorized JavaScript origins**. Google Sign-In yêu cầu HTTPS khi chạy trên mạng thật (localhost được hỗ trợ khi phát triển).
+- Máy chủ .NET cần các biến môi trường sau. Dùng Google Client ID công khai và Gmail App Password (bật xác minh 2 bước cho tài khoản Gmail); không dùng mật khẩu đăng nhập Gmail thông thường:
+
+```powershell
+$env:GOOGLE_CLIENT_ID = "client-id.apps.googleusercontent.com"
+$env:COFFEE_SMTP_HOST = "smtp.gmail.com"
+$env:COFFEE_SMTP_PORT = "587"
+$env:COFFEE_SMTP_USER = "quanao@gmail.com"
+$env:COFFEE_SMTP_PASSWORD = "gmail-app-password"
+$env:COFFEE_SMTP_FROM = "quanao@gmail.com"
+npm.cmd run prepare:server
+npm.cmd run server:dotnet
+```
+
+Thay các giá trị ví dụ bằng thông tin của bạn. Chạy lệnh build một lần sau khi cập nhật mã hoặc dependency. Backend .NET tự đọc file `.env` ở thư mục chạy ứng dụng hoặc thư mục dự án gần nhất; giá trị môi trường Windows đã đặt sẽ được ưu tiên. Có thể tiếp tục dùng Windows Environment Variables thay cho `.env`.
+
+Các biến SMTP trong `.env` sẽ có hiệu lực sau khi khởi động lại API. Với Gmail, có thể dán App Password theo đúng định dạng chia nhóm có khoảng trắng; API tự bỏ khoảng trắng khỏi mật khẩu Gmail trước khi đăng nhập SMTP. Dùng thông tin SMTP thực tế của nhà cung cấp email; không để trống mật khẩu hoặc đưa `.env` lên Git/chia sẻ trong gói cài đặt. API tự tạo các bảng xác thực còn thiếu khi khởi động.
+
 ## Khởi chạy bản hiện tại
 
-Chạy `npm run server:dotnet`, sau đó mở terminal thứ hai chạy `npm run dev`. API ở `http://localhost:3032/api`; endpoint kiểm tra là `http://localhost:3032/api/health`. Migration được chạy an toàn lúc backend khởi động và không xóa dữ liệu hiện có.
+Mặc định, API kết nối SQL Server tại `127.0.0.1:1433` bằng Windows Authentication. Nếu SQL Server nằm trên máy khác hoặc dùng SQL Authentication, đặt biến `COFFEE_SQL_CONNECTION_STRING` trong `.env` hoặc cửa sổ PowerShell chạy API:
+
+```powershell
+$env:COFFEE_SQL_CONNECTION_STRING = "Server=192.168.1.10,1433;Database=master;User ID=coffee_app;Password=<mat-khau>;Encrypt=True;TrustServerCertificate=True"
+npm.cmd run server:dotnet
+```
+
+Thay địa chỉ, cổng và tài khoản bằng cấu hình SQL Server của bạn; không lưu mật khẩu thật trong Git. Với Windows Authentication, chạy API bằng tài khoản Windows được cấp quyền trên SQL Server và dùng chuỗi dạng `Server=192.168.1.10,1433;Database=master;Integrated Security=True;Encrypt=True;TrustServerCertificate=True`. Máy SQL Server cần bật TCP/IP, cho phép kết nối mạng và mở cổng SQL trong firewall cho mạng tin cậy. Chạy `npm.cmd run server:dotnet` trong đúng cửa sổ đã đặt biến môi trường. API ở `http://localhost:3032/api`; endpoint kiểm tra là `http://localhost:3032/api/health`. Migration được chạy an toàn lúc backend khởi động và không xóa dữ liệu hiện có.
 
 ## Máy in bill, két tiền và thông báo
 

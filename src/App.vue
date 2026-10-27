@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import ManagementSuite from './ManagementSuite.vue'
 
 const activeView = ref('Sơ đồ bàn')
@@ -42,8 +42,23 @@ function jwtExpired(value){try{const part=value.split('.')[1].replace(/-/g,'+').
 const token = ref(savedToken && !jwtExpired(savedToken) ? savedToken : '')
 if(!token.value){localStorage.removeItem('coffee_token');localStorage.removeItem('coffee_user')}
 const loginForm = ref({ email: '', password: '' })
+const registrationForm = ref({ name: '', email: '', password: '' })
 const loginError = ref('')
+const registrationError = ref('')
+const registering = ref(false)
 const signingIn = ref(false)
+const authView = ref('login')
+const registrationEnabled = ref(false)
+const googleClientId = ref('')
+const googleButton = ref(null)
+const googleAuthError = ref('')
+const recoveryEmail = ref('')
+const recoveryCode = ref('')
+const recoveryPassword = ref('')
+const recoveryMessage = ref('')
+const recoveryError = ref('')
+const requestingReset = ref(false)
+const resettingPassword = ref(false)
 const licenseStatus = ref(null)
 const licenseKey = ref('')
 const licenseError = ref('')
@@ -211,7 +226,9 @@ async function api(path, options = {}) {
   try { response = await fetch(`${apiUrl}${path}`, { ...options, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token.value}`, ...(options.headers || {}) } }) }
   catch { const error=new Error('Không kết nối được API. Hãy mở trang bằng Chrome/Safari thay vì Messenger.');error.status=0;throw error }
   const raw = await response.text()
-  const data = raw ? JSON.parse(raw) : null
+  let data = null
+  try { data = raw ? JSON.parse(raw) : null }
+  catch { if(response.ok){const error=new Error('Máy chủ trả về dữ liệu không hợp lệ.');error.status=response.status;throw error} }
   if (!response.ok) {
     const error = new Error(data?.error || (response.status===401?'Phiên đăng nhập không còn hợp lệ.':'Không thể kết nối máy chủ.'))
     error.status = response.status
@@ -249,17 +266,98 @@ async function loadData() {
   if(currentOrder.value?.id&&(showOrder.value||showReceipt.value))try{currentOrder.value=await api(`/orders/${currentOrder.value.id}`)}catch{}
   if(selectedKdsOrder.value?.id&&showKdsOrder.value)try{selectedKdsOrder.value=await api(`/orders/${selectedKdsOrder.value.id}`)}catch{}
 }
+async function finishLogin(result) {
+  token.value = result.token
+  currentUser.value = result.user
+  activeView.value = roleViews[result.user.role]?.[0] || 'Tổng quan'
+  localStorage.setItem('coffee_token', token.value)
+  localStorage.setItem('coffee_user', JSON.stringify(result.user))
+  await loadData()
+}
 async function login() {
   loginError.value = ''; signingIn.value = true
-  try { const result = await api('/auth/login', { method:'POST', headers:{}, body:JSON.stringify(loginForm.value) }); token.value = result.token; currentUser.value = result.user; activeView.value = roleViews[result.user.role]?.[0] || 'Tổng quan'; localStorage.setItem('coffee_token', token.value); localStorage.setItem('coffee_user', JSON.stringify(result.user)); await loadData() }
-  catch (error) { if(error.status===402)await checkLicense();loginError.value = error.status === 401 ? 'Email hoặc mật khẩu không đúng.' : (error.message || 'Không thể kết nối máy chủ.') }
+  try { await finishLogin(await api('/auth/login', { method:'POST', headers:{}, body:JSON.stringify(loginForm.value) })) }
+  catch (error) { if(token.value)logout();if(error.status===402)await checkLicense();loginError.value = error.status === 401 ? 'Email hoặc mật khẩu không đúng.' : (error.message || 'Không thể kết nối máy chủ.') }
   finally { signingIn.value = false }
 }
+async function register() {
+  registrationError.value = ''
+  if (!registrationEnabled.value) return
+  registering.value = true
+  try {
+    const result = await api('/auth/register', { method:'POST', headers:{}, body:JSON.stringify(registrationForm.value) })
+    await finishLogin(result)
+  } catch (error) { registrationError.value = error.message || 'Không thể tạo tài khoản.' }
+  finally { registering.value = false }
+}
+async function googleLogin(credential) {
+  if (!credential || signingIn.value) return
+  loginError.value = ''; googleAuthError.value = ''; signingIn.value = true
+  try { await finishLogin(await api('/auth/google', { method:'POST', body:JSON.stringify({credential}) })) }
+  catch (error) { if(token.value)logout();loginError.value = error.message || 'Không thể đăng nhập bằng Google.' }
+  finally { signingIn.value = false }
+}
+async function requestPasswordReset() {
+  requestingReset.value = true; recoveryError.value = ''; recoveryMessage.value = ''
+  try {
+    const result = await api('/auth/password-reset/request', { method:'POST', body:JSON.stringify({email:recoveryEmail.value}) })
+    recoveryMessage.value = result.message
+    authView.value = 'reset'
+  } catch (error) { recoveryError.value = error.message }
+  finally { requestingReset.value = false }
+}
+async function confirmPasswordReset() {
+  resettingPassword.value = true; recoveryError.value = ''; recoveryMessage.value = ''
+  try {
+    const result = await api('/auth/password-reset/confirm', { method:'POST', body:JSON.stringify({email:recoveryEmail.value,code:recoveryCode.value,newPassword:recoveryPassword.value}) })
+    recoveryMessage.value = result.message
+    loginForm.value.email = recoveryEmail.value
+    loginForm.value.password = ''
+    recoveryCode.value = ''; recoveryPassword.value = ''
+    authView.value = 'login'
+  } catch (error) { recoveryError.value = error.message }
+  finally { resettingPassword.value = false }
+}
+function loadGoogleIdentity() {
+  if (window.google?.accounts?.id) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script')
+    script.src = 'https://accounts.google.com/gsi/client'
+    script.async = true
+    script.defer = true
+    script.onload = () => window.google?.accounts?.id ? resolve() : reject(new Error('Không thể khởi tạo đăng nhập Google.'))
+    script.onerror = () => reject(new Error('Không tải được dịch vụ đăng nhập Google.'))
+    document.head.appendChild(script)
+  })
+}
+function renderGoogleButton() {
+  if (!googleButton.value || !googleClientId.value || !window.google?.accounts?.id) return
+  window.google.accounts.id.initialize({client_id:googleClientId.value,callback:response=>googleLogin(response.credential)})
+  window.google.accounts.id.renderButton(googleButton.value,{theme:'outline',size:'large',text:'continue_with',shape:'rectangular',width:300,locale:'vi'})
+}
+async function setupGoogleSignIn() {
+  try {
+    const config = await api('/auth/config')
+    googleClientId.value = config.googleClientId || ''
+    registrationEnabled.value = config.allowRegistration === true
+    if (googleClientId.value) {
+      await loadGoogleIdentity()
+      await nextTick()
+      renderGoogleButton()
+    }
+  } catch (error) { googleAuthError.value = error.message || 'Không thể khởi tạo đăng nhập Google.' }
+}
+watch(authView, async view => {
+  if (view === 'login' && googleClientId.value) {
+    await nextTick()
+    renderGoogleButton()
+  }
+})
 function logout() { sidebarOpen.value=false;localStorage.removeItem('coffee_token'); localStorage.removeItem('coffee_user'); token.value = ''; currentUser.value = null;readyOrderIds.value=new Set();readyTrackingStarted.value=false;billRequestIds.value=new Set();billTrackingStarted.value=false }
 async function checkLicense(){try{licenseStatus.value=await api('/license/status')}catch(error){licenseError.value=error.message}}
 async function activateLicense(){if(!licenseKey.value.trim())return;activatingLicense.value=true;licenseError.value='';try{licenseStatus.value=await api('/license/activate',{method:'POST',body:JSON.stringify({key:licenseKey.value.trim()})});licenseKey.value='';notify('Kích hoạt bản quyền thành công')}catch(error){licenseError.value=error.message}finally{activatingLicense.value=false}}
 async function copyInstallationId(){try{await navigator.clipboard.writeText(licenseStatus.value.installationId);notify('Đã sao chép mã máy')}catch{notify('Hãy giữ và gửi mã máy này cho nhà cung cấp')}}
-onMounted(async () => { await checkLicense();if(!licenseStatus.value?.allowed)return;if (token.value) try { if(!roleViews[currentUser.value?.role]?.includes(activeView.value)) activeView.value=roleViews[currentUser.value?.role]?.[0]||'Tổng quan'; await loadData() } catch { logout() } })
+onMounted(async () => { await checkLicense();if(!licenseStatus.value?.allowed)return;if (token.value) try { if(!roleViews[currentUser.value?.role]?.includes(activeView.value)) activeView.value=roleViews[currentUser.value?.role]?.[0]||'Tổng quan'; await loadData() } catch { logout() } else await setupGoogleSignIn() })
 let syncRunning=false
 const syncTimer = setInterval(async () => { if(!token.value||syncRunning)return;syncRunning=true;try{await loadData()}catch(error){if(error.status===401)logout()}finally{syncRunning=false} }, 2000)
 onUnmounted(() => { clearInterval(syncTimer);if(newProductPreview.value)URL.revokeObjectURL(newProductPreview.value) })
@@ -435,7 +533,53 @@ async function submitOrder() {
       <form class="login-card license-card" @submit.prevent="activateLicense"><div class="brand"><span class="brand-mark">R</span><span>ROAST<br><i>& ROOT</i></span></div><p class="eyebrow">KÍCH HOẠT COFFEE OS</p><h2>Thời hạn sử dụng đã hết</h2><p>{{ licenseStatus.message }}</p><label>Mã máy<div class="installation-id"><code>{{ licenseStatus.installationId }}</code><button type="button" @click="copyInstallationId">Sao chép</button></div></label><label>Key bản quyền<textarea v-model="licenseKey" rows="5" placeholder="Dán key do nhà cung cấp gửi" required></textarea></label><small v-if="licenseError" class="login-error">{{ licenseError }}</small><button class="send-order" :disabled="activatingLicense">{{ activatingLicense ? 'Đang kiểm tra...' : 'Kích hoạt →' }}</button><small class="license-help">Gửi mã máy cho nhà cung cấp để nhận key. Key của máy khác sẽ không sử dụng được.</small></form>
     </div>
     <div v-else-if="!token" class="login-screen">
-      <form class="login-card" @submit.prevent="login"><div class="brand"><span class="brand-mark">R</span><span>ROAST<br><i>& ROOT</i></span></div><p class="eyebrow">COFFEE OPERATING SYSTEM</p><h2>Chào mừng trở lại</h2><p>Đăng nhập để làm việc với dữ liệu cửa hàng.</p><label>Email<input v-model="loginForm.email" type="email" placeholder="owner@tenquan.vn" required></label><label>Mật khẩu<input v-model="loginForm.password" type="password" placeholder="••••••••" required></label><small v-if="loginError" class="login-error">{{ loginError }}</small><button class="send-order" :disabled="signingIn">{{ signingIn ? 'Đang đăng nhập...' : 'Đăng nhập →' }}</button></form>
+      <section class="login-card">
+        <div class="brand"><span class="brand-mark">R</span><span>ROAST<br><i>& ROOT</i></span></div>
+        <p class="eyebrow">COFFEE OPERATING SYSTEM</p>
+        <template v-if="authView === 'login'">
+          <h2>Chào mừng trở lại</h2>
+          <p>Đăng nhập để làm việc với dữ liệu cửa hàng.</p>
+          <small v-if="recoveryMessage" class="recovery-message">{{ recoveryMessage }}</small>
+          <form @submit.prevent="login">
+            <label>Email<input v-model="loginForm.email" type="email" placeholder="owner@tenquan.vn" autocomplete="username" required></label>
+            <label>Mật khẩu<input v-model="loginForm.password" type="password" placeholder="••••••••" autocomplete="current-password" required></label>
+            <button type="button" class="forgot-password" @click="recoveryEmail=loginForm.email;recoveryError='';recoveryMessage='';authView='forgot'">Quên mật khẩu?</button>
+            <small v-if="loginError" class="login-error">{{ loginError }}</small>
+            <button class="send-order" :disabled="signingIn">{{ signingIn ? 'Đang đăng nhập...' : 'Đăng nhập →' }}</button>
+          </form>
+          <button v-if="registrationEnabled" type="button" class="forgot-password register-link" @click="registrationError='';authView='register'">Chưa có tài khoản? Đăng ký</button>
+          <div v-if="googleClientId" ref="googleButton" class="google-sign-in"></div>
+          <small v-if="googleAuthError" class="login-error">{{ googleAuthError }}</small>
+        </template>
+        <form v-else-if="authView === 'register'" @submit.prevent="register">
+          <h2>Tạo tài khoản</h2>
+          <p>Tài khoản mới sẽ được cấp quyền Phục vụ.</p>
+          <label>Họ tên<input v-model.trim="registrationForm.name" type="text" maxlength="150" autocomplete="name" required></label>
+          <label>Email<input v-model.trim="registrationForm.email" type="email" maxlength="255" autocomplete="email" required></label>
+          <label>Mật khẩu<input v-model="registrationForm.password" type="password" minlength="8" autocomplete="new-password" required></label>
+          <small v-if="registrationError" class="login-error">{{ registrationError }}</small>
+          <button class="send-order" :disabled="registering">{{ registering ? 'Đang tạo tài khoản...' : 'Đăng ký →' }}</button>
+          <button type="button" class="forgot-password" @click="authView='login'">Quay lại đăng nhập</button>
+        </form>
+        <form v-else-if="authView === 'forgot'" @submit.prevent="requestPasswordReset">
+          <h2>Quên mật khẩu?</h2>
+          <p>Nhập email tài khoản. Nếu đã đăng ký, bạn sẽ nhận được mã xác thực.</p>
+          <label>Email<input v-model="recoveryEmail" type="email" autocomplete="email" required></label>
+          <small v-if="recoveryError" class="login-error">{{ recoveryError }}</small>
+          <button class="send-order" :disabled="requestingReset">{{ requestingReset ? 'Đang gửi...' : 'Gửi mã xác thực →' }}</button>
+          <button type="button" class="forgot-password" @click="authView='login'">Quay lại đăng nhập</button>
+        </form>
+        <form v-else @submit.prevent="confirmPasswordReset">
+          <h2>Đặt lại mật khẩu</h2>
+          <p>{{ recoveryMessage || 'Nhập mã 6 số trong email và tạo mật khẩu mới. Mã có hiệu lực trong 10 phút.' }}</p>
+          <label>Email<input v-model="recoveryEmail" type="email" autocomplete="email" required></label>
+          <label>Mã xác thực<input v-model="recoveryCode" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" required></label>
+          <label>Mật khẩu mới<input v-model="recoveryPassword" type="password" autocomplete="new-password" minlength="8" required></label>
+          <small v-if="recoveryError" class="login-error">{{ recoveryError }}</small>
+          <button class="send-order" :disabled="resettingPassword">{{ resettingPassword ? 'Đang cập nhật...' : 'Đặt lại mật khẩu →' }}</button>
+          <button type="button" class="forgot-password" @click="authView='login'">Quay lại đăng nhập</button>
+        </form>
+      </section>
     </div>
     <button v-if="token && sidebarOpen" class="sidebar-overlay" aria-label="Đóng menu" @click="sidebarOpen=false"></button>
     <aside v-if="token" class="sidebar" :class="{open:sidebarOpen}">
