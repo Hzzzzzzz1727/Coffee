@@ -95,6 +95,8 @@ const transferTargetId = ref('')
 const mergeTarget = ref(false)
 const layoutEditing = ref(false)
 const dragTable = ref(null)
+const floorCanvas = ref(null)
+const layoutScale = ref(1)
 const printerSettings = ref({printerName:'',autoPrint:false,openCashDrawer:false})
 const newUser = ref({ name:'', email:'', password:'', role:'server' })
 const editingUserId = ref('')
@@ -234,8 +236,26 @@ async function loadData() {
     billRequestIds.value=requestedNow;billTrackingStarted.value=true
   }
   if (reportResult.status === 'fulfilled') report.value = reportResult.value
-  if (areaResult.status === 'fulfilled') { areas.value=areaResult.value;if(!areas.value.some(a=>a.id===selectedAreaId.value))selectedAreaId.value=areas.value[0]?.id||'';if(!newTable.value.areaId)newTable.value.areaId=selectedAreaId.value }
-  if (tableResult.status === 'fulfilled') tables.value = tableResult.value.map(t => ({ ...t, tone: statusTone[t.status] || 'free', status: { available:'Trống', occupied:'Đang dùng', payment_requested:'Chờ thanh toán', ordering:'Đang gọi món', reserved:'Đặt trước' }[t.status] || t.status, bill: t.total ? new Intl.NumberFormat('vi-VN').format(t.total) + 'đ' : '', time: t.openedAt ? 'Đang phục vụ' : '' }))
+  if (areaResult.status === 'fulfilled') {
+    const localAreas=new Map(areas.value.map(area=>[area.id,area]))
+    areas.value=areaResult.value.map(area=>{
+      const local=localAreas.get(area.id)
+      if(!layoutEditing.value||!local)return area
+      return {...area,name:local.name,canvasWidth:local.canvasWidth,canvasHeight:local.canvasHeight}
+    })
+    if(!areas.value.some(a=>a.id===selectedAreaId.value))selectedAreaId.value=areas.value[0]?.id||''
+    if(!newTable.value.areaId)newTable.value.areaId=selectedAreaId.value
+  }
+  if (tableResult.status === 'fulfilled') {
+    const localTables=new Map(tables.value.map(table=>[table.id??table.Id,table]))
+    tables.value=tableResult.value.map(t => {
+      const normalized={ ...t, tone: statusTone[t.status] || 'free', status: { available:'Trống', occupied:'Đang dùng', payment_requested:'Chờ thanh toán', ordering:'Đang gọi món', reserved:'Đặt trước' }[t.status] || t.status, bill: t.total ? new Intl.NumberFormat('vi-VN').format(t.total) + 'đ' : '', time: t.openedAt ? 'Đang phục vụ' : '' }
+      const local=localTables.get(t.id??t.Id)
+      if(!layoutEditing.value||!local)return normalized
+      return {...normalized,areaId:local.areaId,positionX:local.positionX,positionY:local.positionY,width:local.width,height:local.height,shape:local.shape}
+    })
+    if(layoutEditing.value&&layoutSelectedTable.value)layoutSelectedTable.value=tables.value.find(table=>(table.id??table.Id)===(layoutSelectedTable.value.id??layoutSelectedTable.value.Id))||null
+  }
   if (menuResult.status === 'fulfilled') menu.value = menuResult.value.map(p => ({ ...p, id:p.id ?? p.Id, name:p.name ?? p.Name, imageUrl:p.imageUrl ?? p.ImageUrl ?? '', isAvailable:p.isAvailable ?? true, emoji:productIcon(p.name ?? p.Name) }))
   if (toppingResult.status === 'fulfilled') toppings.value = toppingResult.value
   if (kdsResult.status === 'fulfilled') {
@@ -263,6 +283,8 @@ onMounted(async () => { await checkLicense();if(!licenseStatus.value?.allowed)re
 let syncRunning=false
 const syncTimer = setInterval(async () => { if(!token.value||syncRunning)return;syncRunning=true;try{await loadData()}catch(error){if(error.status===401)logout()}finally{syncRunning=false} }, 2000)
 onUnmounted(() => { clearInterval(syncTimer);if(newProductPreview.value)URL.revokeObjectURL(newProductPreview.value) })
+onMounted(() => window.addEventListener('resize', updateLayoutScale))
+onUnmounted(() => window.removeEventListener('resize', updateLayoutScale))
 function addItem(item) {
   if(!item.isAvailable)return notify('Món này đang tạm hết')
   const found = cart.value.find(x => x.name === item.name)
@@ -304,6 +326,16 @@ async function selectView(view) {
   } catch (error) { notify(error.message) }
 }
 function openNewOrder() { if (!tables.value.length) return notify('Hãy thêm bàn trước khi tạo đơn'); showTablePicker.value = true }
+async function selectArea(area) { selectedAreaId.value=area.id;newTable.value.areaId=area.id;layoutSelectedTable.value=null;await nextTick();updateLayoutScale() }
+async function toggleLayoutEditor(){layoutEditing.value=!layoutEditing.value;layoutSelectedTable.value=null;await nextTick();updateLayoutScale()}
+function updateLayoutScale(){
+  if(!layoutEditing.value){layoutScale.value=1;return}
+  const viewportWidth=Math.max(320,(floorCanvas.value?.clientWidth||1000)-24)
+  const canvasWidth=Math.max(500,Number(activeArea.value?.canvasWidth)||1000)
+  const viewportHeight=Math.max(420,Math.min(680,window.innerHeight-260))
+  const canvasHeight=Math.max(400,Number(activeArea.value?.canvasHeight)||600)
+  layoutScale.value=Math.min(1,viewportWidth/canvasWidth,viewportHeight/canvasHeight)
+}
 async function chooseTable(table) { await openTable(table);showTablePicker.value=false }
 async function openTable(table) { selectedTable.value=table.name;selectedTableId.value=table.Id || table.id;currentOrder.value=null;selectedCustomer.value=null;customerForm.value={name:'',phone:''};promoCode.value='';try{const existing=await api(`/tables/${selectedTableId.value}/order`);currentOrder.value=existing?.id?existing:null}catch(error){notify(error.message)}showOrder.value=true }
 function changeQty(item, amount) { item.qty += amount; if (item.qty <= 0) cart.value = cart.value.filter(x => x !== item) }
@@ -341,11 +373,32 @@ async function redeemPoints(){if(!currentOrder.value)return;try{const result=awa
 function openTransfer(){transferTargetId.value='';mergeTarget.value=false;showTransfer.value=true}
 async function transferOrder(){if(!currentOrder.value||!transferTargetId.value)return;try{const result=await api('/tables/transfer',{method:'POST',body:JSON.stringify({orderId:currentOrder.value.id,targetTableId:transferTargetId.value,merge:mergeTarget.value})});showTransfer.value=false;showOrder.value=false;await loadData();notify(result.merged?'Đã gộp bàn và cộng đơn':'Đã đổi bàn thành công')}catch(error){notify(error.message)}}
 function beginTableDrag(event,table){if(!layoutEditing.value)return;dragTable.value=table;event.dataTransfer.effectAllowed='move'}
-async function dropTable(event){if(!layoutEditing.value||!dragTable.value)return;const floor=event.currentTarget.getBoundingClientRect();const width=dragTable.value.width||190,height=dragTable.value.height||120;const x=Math.max(0,Math.min((activeArea.value?.canvasWidth||1000)-width,Math.round(event.clientX-floor.left-width/2+event.currentTarget.scrollLeft)));const y=Math.max(0,Math.min((activeArea.value?.canvasHeight||600)-height,Math.round(event.clientY-floor.top-height/2+event.currentTarget.scrollTop)));dragTable.value.positionX=x;dragTable.value.positionY=y;layoutSelectedTable.value=dragTable.value;try{await saveTableLayout(dragTable.value,false);notify('Đã lưu vị trí bàn')}catch(error){notify(error.message)}finally{dragTable.value=null}}
-function selectLayoutTable(table){layoutSelectedTable.value=table}
+async function dropTable(event){if(!layoutEditing.value||!dragTable.value)return;const floor=event.currentTarget.getBoundingClientRect();const scale=layoutScale.value||1;let width=Number(dragTable.value.width)||190,height=Number(dragTable.value.height)||120;if(dragTable.value.shape==='round'){width=height=normalizedTableSize(dragTable.value);dragTable.value.width=width;dragTable.value.height=height}const pointerX=(event.clientX-floor.left+event.currentTarget.scrollLeft)/scale;const pointerY=(event.clientY-floor.top+event.currentTarget.scrollTop)/scale;const x=Math.max(0,Math.min((activeArea.value?.canvasWidth||1000)-width,Math.round(pointerX-width/2)));const y=Math.max(0,Math.min((activeArea.value?.canvasHeight||600)-height,Math.round(pointerY-height/2)));dragTable.value.positionX=x;dragTable.value.positionY=y;layoutSelectedTable.value=dragTable.value;try{await saveTableLayout(dragTable.value,false);notify('Đã lưu vị trí bàn')}catch(error){notify(error.message)}finally{dragTable.value=null}}
+function normalizedTableSize(table){
+  const width=Number(table?.width)||190,height=Number(table?.height)||120
+  return Math.max(140,Math.min(260,Math.round((width+height)/2)))
+}
+function normalizeLayoutTableShape(table=layoutSelectedTable.value){
+  if(!table||table.shape!=='round')return
+  const size=normalizedTableSize(table)
+  table.width=size
+  table.height=size
+}
+function selectLayoutTable(table){layoutSelectedTable.value=table;normalizeLayoutTableShape(table)}
 async function saveTableLayout(table=layoutSelectedTable.value,showNotice=true){if(!table)return;await api(`/tables/${table.Id||table.id}/layout`,{method:'PATCH',body:JSON.stringify({areaId:table.areaId,x:Number(table.positionX)||0,y:Number(table.positionY)||0,width:Number(table.width)||190,height:Number(table.height)||120,shape:table.shape||'rectangle'})});if(showNotice)notify('Đã lưu kiểu và kích thước bàn')}
-function tableStyle(table,index){if(!layoutEditing.value)return {};const hasPosition=table.positionX||table.positionY;return {position:'absolute',left:(hasPosition?table.positionX:20+(index%4)*215)+'px',top:(hasPosition?table.positionY:20+Math.floor(index/4)*145)+'px',width:(table.width||190)+'px',height:(table.height||120)+'px'}}
-function areaCanvasStyle(){return layoutEditing.value?{'--canvas-width':(activeArea.value?.canvasWidth||1000)+'px','--canvas-height':(activeArea.value?.canvasHeight||600)+'px'}:{}}
+function tableStyle(table,index){
+  if(!layoutEditing.value)return {}
+  const scale=layoutScale.value||1
+  let width=Number(table.width)||190,height=Number(table.height)||120
+  if(table.shape==='round')width=height=normalizedTableSize(table)
+  const storedX=Number(table.positionX),storedY=Number(table.positionY)
+  const hasPosition=table.positionX!==null&&table.positionX!==undefined&&table.positionY!==null&&table.positionY!==undefined&&Number.isFinite(storedX)&&Number.isFinite(storedY)
+  const fallbackX=20+(index%4)*215,fallbackY=20+Math.floor(index/4)*145
+  const x=Math.max(0,Math.min((activeArea.value?.canvasWidth||1000)-width,hasPosition?storedX:fallbackX))
+  const y=Math.max(0,Math.min((activeArea.value?.canvasHeight||600)-height,hasPosition?storedY:fallbackY))
+  return {position:'absolute',left:(x*scale)+'px',top:(y*scale)+'px',width:width+'px',height:height+'px',transform:`scale(${scale})`,transformOrigin:'top left'}
+}
+function areaCanvasStyle(){if(!layoutEditing.value)return {};const width=activeArea.value?.canvasWidth||1000,height=activeArea.value?.canvasHeight||600,scale=layoutScale.value||1;return {'--canvas-width':(width*scale)+'px','--canvas-height':(height*scale)+'px','--layout-scale':scale}}
 async function loadPrinterSettings(){try{printerSettings.value=await api('/printer/settings')}catch(error){notify(error.message)}}
 async function savePrinterSettings(){try{printerSettings.value=await api('/printer/settings',{method:'PUT',body:JSON.stringify(printerSettings.value)});notify('Đã lưu cấu hình máy in')}catch(error){notify(error.message)}}
 async function testPrinter(){try{await api('/printer/test',{method:'POST'});notify('Máy in đã nhận bản in thử')}catch(error){notify(error.message)}}
@@ -449,11 +502,39 @@ async function submitOrder() {
       <header><button class="mobile-menu" aria-label="Mở menu" @click="sidebarOpen=true"><span></span><span></span><span></span></button><div class="page-heading"><div class="heading-context"><p class="eyebrow">COFFEE OS</p><span>{{ roleNames[currentUser?.role] || currentUser?.role }}</span></div><h1>{{ activeView }}</h1><p class="page-description">{{ pageDescriptions[activeView] }}</p></div><div class="header-actions"><button v-if="['owner','manager','cashier','server'].includes(currentUser?.role)" class="new-order" @click="openNewOrder"><span>＋</span> Tạo đơn mới</button></div></header>
       <div v-if="activeView === 'Tổng quan'" class="metrics"><div><span>DOANH THU HÔM NAY</span><strong>{{ new Intl.NumberFormat('vi-VN').format(report.revenue) }}đ</strong><small>Dữ liệu từ giao dịch thật</small></div><div><span>ĐƠN ĐANG PHỤC VỤ</span><strong>{{ allOrders.filter(o=>!['paid','cancelled'].includes(o.status)).length }} <i>đơn</i></strong><small>Đơn chưa thanh toán</small></div><div><span>TỔNG SỐ BÀN</span><strong>{{ tables.length }} <i>bàn</i></strong><small>{{ tables.filter(t => t.tone === 'free').length }} bàn trống</small></div><div><span>MENU ĐANG BÁN</span><strong>{{ menu.length }} <i>món</i></strong><small>Dữ liệu SQL Server</small></div></div>
       <template v-if="activeView === 'Sơ đồ bàn' || activeView === 'Tổng quan'">
-        <div class="area-toolbar"><div class="area-tabs"><button v-for="area in areas" :key="area.id" :class="{active:selectedAreaId===area.id}" @click="selectedAreaId=area.id;newTable.areaId=area.id;layoutSelectedTable=null">{{ area.name }} <small>{{ area.tableCount }}</small></button></div><button v-if="['owner','manager'].includes(currentUser?.role)" class="add-area-btn" @click="showAreaForm=!showAreaForm">＋ Khu vực</button></div>
+        <div class="area-toolbar"><div class="area-tabs"><button v-for="area in areas" :key="area.id" :class="{active:selectedAreaId===area.id}" @click="selectArea(area)">{{ area.name }} <small>{{ area.tableCount }}</small></button></div><button v-if="['owner','manager'].includes(currentUser?.role)" class="add-area-btn" @click="showAreaForm=!showAreaForm">＋ Khu vực</button></div>
         <form v-if="showAreaForm" class="panel-card area-form" @submit.prevent="createArea"><input v-model="newArea.name" placeholder="Tên khu vực, ví dụ Sân vườn" required><label>Rộng <input v-model="newArea.canvasWidth" type="number" min="500" max="2400"></label><label>Cao <input v-model="newArea.canvasHeight" type="number" min="400" max="1600"></label><button class="new-order">Tạo khu vực</button></form>
-        <section class="floor-head"><div><h2>{{ activeArea?.name || 'Khu vực' }} <span>{{ areaTables.length }} bàn</span></h2><p>{{ layoutEditing ? 'Kéo bàn để di chuyển; chọn bàn để đổi kiểu và kích thước' : 'Chạm vào bàn để xem chi tiết, gọi thêm hoặc tính tiền' }}</p></div><div class="floor-tools"><button v-if="['owner','manager'].includes(currentUser?.role)" class="notice-enable" @click="layoutEditing=!layoutEditing;layoutSelectedTable=null">{{ layoutEditing ? '✓ Hoàn tất chỉnh sơ đồ' : '✥ Chỉnh sơ đồ' }}</button><button class="new-order" @click="showTableForm=!showTableForm">＋ Thêm bàn</button></div></section>
+        <section class="floor-head"><div><h2>{{ activeArea?.name || 'Khu vực' }} <span>{{ areaTables.length }} bàn</span></h2><p>{{ layoutEditing ? `Đang hiển thị ${Math.round(layoutScale*100)}% · kéo bàn để di chuyển, chọn bàn để đổi kích thước` : 'Chạm vào bàn để xem chi tiết, gọi thêm hoặc tính tiền' }}</p></div><div class="floor-tools"><button v-if="['owner','manager'].includes(currentUser?.role)" class="notice-enable" @click="toggleLayoutEditor">{{ layoutEditing ? '✓ Hoàn tất chỉnh sơ đồ' : '✥ Chỉnh sơ đồ' }}</button><button class="new-order" @click="showTableForm=!showTableForm">＋ Thêm bàn</button></div></section>
         <form v-if="showTableForm" class="panel-card table-form advanced-table-form" @submit.prevent="createTable"><input v-model="newTable.name" placeholder="Tên bàn, ví dụ Bàn 01" required><input v-model="newTable.seats" type="number" min="1" max="30" placeholder="Số ghế" required><select v-model="newTable.areaId" required><option v-for="area in areas" :key="area.id" :value="area.id">{{ area.name }}</option></select><select v-model="newTable.shape"><option value="rectangle">Chữ nhật</option><option value="round">Tròn</option><option value="square">Vuông</option></select><button class="new-order">Lưu bàn</button></form>
-        <section class="content-grid"><div class="floor" :class="{'layout-editing':layoutEditing}" :style="areaCanvasStyle()" @dragover.prevent @drop="dropTable"><div v-for="(table,index) in areaTables" :key="table.name" class="table-card" role="button" tabindex="0" :aria-label="`${table.name}, ${table.status}${table.bill ? ', '+table.bill : ''}`" :draggable="layoutEditing" :style="tableStyle(table,index)" @dragstart="beginTableDrag($event,table)" :class="[table.tone,'shape-'+(table.shape||'rectangle'),{selected:selectedTable===table.name,'layout-selected':layoutSelectedTable==table}]" @click="layoutEditing ? selectLayoutTable(table) : openTable(table)" @keydown.enter.prevent="layoutEditing ? selectLayoutTable(table) : openTable(table)" @keydown.space.prevent="layoutEditing ? selectLayoutTable(table) : openTable(table)"><div class="table-top"><b>{{ table.name }}</b><span>♟ {{ table.seats }}</span></div><div class="table-middle"><i></i><i></i></div><div class="table-info"><strong>{{ table.status }}</strong><span v-if="table.time">{{ table.time }}</span><small v-if="table.bill">{{ table.bill }}</small></div></div><p v-if="!areaTables.length" class="empty">Khu vực này chưa có bàn.</p><div class="window-label">SƠ ĐỒ {{ activeArea?.name?.toUpperCase() }}</div><div v-if="layoutEditing" class="layout-inspector" @click.stop><h3>Thiết lập sơ đồ</h3><label>Tên khu vực<input v-model="activeArea.name"></label><div class="inspector-pair"><label>Rộng<input v-model.number="activeArea.canvasWidth" type="number" min="500" max="2400"></label><label>Cao<input v-model.number="activeArea.canvasHeight" type="number" min="400" max="1600"></label></div><div class="inspector-actions"><button @click="saveArea">Lưu khu vực</button><button class="danger" @click="deleteArea">Xóa</button></div><template v-if="layoutSelectedTable"><hr><h3>{{ layoutSelectedTable.name }}</h3><label>Chuyển khu vực<select v-model="layoutSelectedTable.areaId"><option v-for="area in areas" :key="area.id" :value="area.id">{{ area.name }}</option></select></label><label>Kiểu bàn<select v-model="layoutSelectedTable.shape"><option value="rectangle">Chữ nhật</option><option value="round">Tròn</option><option value="square">Vuông</option></select></label><div class="inspector-pair"><label>Rộng<input v-model.number="layoutSelectedTable.width" type="number" min="90" max="360"></label><label>Cao<input v-model.number="layoutSelectedTable.height" type="number" min="80" max="260"></label></div><button class="save-layout" @click="saveTableLayout()">Lưu bàn</button></template></div></div><aside class="kds"><div class="kds-title"><div><p>PHA CHẾ · KDS</p><h2>Đơn cần xử lý</h2></div><span>{{ orders.length }}</span></div><div v-for="order in orders" :key="order.id" class="order-card clickable" :class="'urgency-'+orderUrgency(order)" @click="openKdsOrder(order)"><div><b>{{ order.table }}</b><span>{{ order.id }} · {{ order.time }}</span></div><p><span class="wait-badge">{{ orderWaitLabel(order) }}</span>{{ order.items }} · Bấm để xem món</p><button :class="order.color" :disabled="!canAdvanceOrder(order)" @click.stop="advanceOrder(order)">{{ orderActionLabel(order) }} <i v-if="canAdvanceOrder(order)">→</i></button></div><button class="view-kds" @click="selectView('Pha chế · KDS')">Mở màn hình pha chế →</button></aside></section>
+        <section class="content-grid" :class="{'editing-grid':layoutEditing}">
+          <div ref="floorCanvas" class="floor" :class="{'layout-editing':layoutEditing}" :style="areaCanvasStyle()" @dragover.prevent @drop="dropTable">
+            <div v-for="(table,index) in areaTables" :key="table.name" class="table-card" role="button" tabindex="0" :aria-label="`${table.name}, ${table.status}${table.bill ? ', '+table.bill : ''}`" :draggable="layoutEditing" :style="tableStyle(table,index)" @dragstart="beginTableDrag($event,table)" :class="[table.tone,'shape-'+(table.shape||'rectangle'),{selected:selectedTable===table.name,'layout-selected':layoutSelectedTable==table}]" @click="layoutEditing ? selectLayoutTable(table) : openTable(table)" @keydown.enter.prevent="layoutEditing ? selectLayoutTable(table) : openTable(table)" @keydown.space.prevent="layoutEditing ? selectLayoutTable(table) : openTable(table)">
+              <div class="table-top"><b>{{ table.name }}</b><span>♟ {{ table.seats }}</span></div>
+              <div class="table-middle"><i></i><i></i></div>
+              <div class="table-info"><strong>{{ table.status }}</strong><span v-if="table.time">{{ table.time }}</span><small v-if="table.bill">{{ table.bill }}</small></div>
+            </div>
+            <p v-if="!areaTables.length" class="empty">Khu vực này chưa có bàn.</p>
+            <div class="window-label">SƠ ĐỒ {{ activeArea?.name?.toUpperCase() }}</div>
+          </div>
+          <aside v-if="layoutEditing" class="layout-inspector layout-inspector-docked" @click.stop>
+            <h3>Thiết lập sơ đồ</h3>
+            <label>Tên khu vực<input v-model="activeArea.name"></label>
+            <div class="inspector-pair">
+              <label>Rộng<input v-model.number="activeArea.canvasWidth" type="number" min="500" max="2400" @input="updateLayoutScale"></label>
+              <label>Cao<input v-model.number="activeArea.canvasHeight" type="number" min="400" max="1600" @input="updateLayoutScale"></label>
+            </div>
+            <div class="inspector-actions"><button @click="saveArea">Lưu khu vực</button><button class="danger" @click="deleteArea">Xóa</button></div>
+            <template v-if="layoutSelectedTable">
+              <hr><h3>{{ layoutSelectedTable.name }}</h3>
+              <label>Chuyển khu vực<select v-model="layoutSelectedTable.areaId"><option v-for="area in areas" :key="area.id" :value="area.id">{{ area.name }}</option></select></label>
+              <label>Kiểu bàn<select v-model="layoutSelectedTable.shape" @change="normalizeLayoutTableShape()"><option value="rectangle">Chữ nhật</option><option value="round">Tròn</option><option value="square">Vuông</option></select></label>
+              <div class="inspector-pair"><label>Rộng<input v-model.number="layoutSelectedTable.width" type="number" min="90" max="360"></label><label>Cao<input v-model.number="layoutSelectedTable.height" type="number" min="80" max="260"></label></div>
+              <button class="save-layout" @click="saveTableLayout()">Lưu bàn</button>
+            </template>
+            <p v-else class="inspector-help">Chọn một bàn trên sơ đồ để chỉnh kiểu, kích thước hoặc chuyển khu vực.</p>
+          </aside>
+          <aside v-else class="kds"><div class="kds-title"><div><p>PHA CHẾ · KDS</p><h2>Đơn cần xử lý</h2></div><span>{{ orders.length }}</span></div><div v-for="order in orders" :key="order.id" class="order-card clickable" :class="'urgency-'+orderUrgency(order)" @click="openKdsOrder(order)"><div><b>{{ order.table }}</b><span>{{ order.id }} · {{ order.time }}</span></div><p><span class="wait-badge">{{ orderWaitLabel(order) }}</span>{{ order.items }} · Bấm để xem món</p><button :class="order.color" :disabled="!canAdvanceOrder(order)" @click.stop="advanceOrder(order)">{{ orderActionLabel(order) }} <i v-if="canAdvanceOrder(order)">→</i></button></div><button class="view-kds" @click="selectView('Pha chế · KDS')">Mở màn hình pha chế →</button></aside>
+        </section>
       </template>
       <section v-else-if="activeView === 'Phục vụ bàn'" class="service-view"><div class="service-heading"><div><p class="eyebrow">DÀNH CHO NHÂN VIÊN PHỤC VỤ</p><h2>Gọi món và theo dõi tiến độ</h2><span>Chọn bàn để tạo đơn hoặc gọi thêm món cho khách.</span></div><div class="service-heading-actions"><button class="notice-enable" @click="enableNotifications">{{ notificationsEnabled ? '✓ Đã bật báo món' : '🔔 Bật báo món' }}</button><button class="new-order" @click="openNewOrder">＋ Chọn bàn gọi món</button></div></div><div class="service-grid"><div class="panel-card"><h2>Bàn phục vụ <span>{{ tables.length }} bàn</span></h2><div class="service-table-grid"><button v-for="table in tables" :key="table.name" :class="table.tone" @click="openTable(table)"><b>{{ table.name }}</b><span>{{ table.status }}</span><small>{{ table.tone === 'free' ? 'Nhận khách & gọi món' : table.tone === 'payment-requested' ? 'Đã gọi thu ngân' : 'Xem đơn / gọi thêm' }}</small></button></div></div><div class="panel-card service-progress"><h2>Tiến độ món</h2><p v-if="!allOrders.filter(o=>!['paid','cancelled'].includes(o.status)).length" class="empty">Chưa có bàn đang phục vụ.</p><div v-for="order in allOrders.filter(o=>!['paid','cancelled'].includes(o.status))" :key="order.id" class="service-order"><button class="service-order-main" @click="openKdsOrder({id:order.id})"><div><b>#{{ order.orderNumber }} · {{ order.tableName }}</b><small>{{ order.itemCount }} món · {{ new Date(order.openedAt).toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'}) }}</small></div><span :class="'status-'+order.status">{{ itemStatusNames[order.status] || order.status }}</span></button><button class="bill-request-btn" :disabled="!!order.billRequestedAt" @click="requestBill(order)">{{ order.billRequestedAt ? '✓ Đã gọi tính tiền' : 'Yêu cầu in bill' }}</button></div></div></div></section>
       <section v-else-if="activeView === 'Thu ngân POS'" class="pos-view"><div class="pos-summary"><div class="priority"><span>CHỜ THANH TOÁN</span><strong>{{ allOrders.filter(o=>o.billRequestedAt&&!['paid','cancelled'].includes(o.status)).length }}</strong><small>Cần xử lý trước</small></div><div><span>ĐƠN ĐANG MỞ</span><strong>{{ allOrders.filter(o=>!['paid','cancelled'].includes(o.status)).length }}</strong><small>Đang phục vụ</small></div><div :class="currentShift ? 'shift-open' : 'shift-closed'"><span>CA HIỆN TẠI</span><strong>{{ currentShift ? 'Đang mở' : 'Chưa mở' }}</strong><small>{{ currentShift ? 'Sẵn sàng nhận thanh toán' : 'Mở ca để thu tiền' }}</small></div></div><div class="panel-card pos-priority-panel"><div class="section-heading"><div><p class="eyebrow">ƯU TIÊN XỬ LÝ</p><h2>Yêu cầu từ phục vụ</h2></div><span>Đơn khách đã yêu cầu tính tiền.</span></div><p v-if="!allOrders.some(o=>o.billRequestedAt&&!['paid','cancelled'].includes(o.status))" class="empty state-empty">✓ Chưa có yêu cầu thanh toán mới.</p><button v-for="order in allOrders.filter(o=>o.billRequestedAt&&!['paid','cancelled'].includes(o.status))" :key="order.id" class="pos-order priority-order" @click="openOrderAtTable(order)"><div><b>#{{ order.orderNumber }} · {{ order.tableName }}</b><small>{{ order.itemCount }} món · yêu cầu {{ new Date(order.billRequestedAt).toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'}) }}</small></div><strong>{{ new Intl.NumberFormat('vi-VN').format(order.total) }}đ</strong><span>Thanh toán →</span></button></div><div class="panel-card"><h2>Tất cả đơn đang mở</h2><p v-if="!allOrders.some(o=>!['paid','cancelled'].includes(o.status))" class="empty state-empty">Không có đơn đang mở.</p><button v-for="order in allOrders.filter(o=>!['paid','cancelled'].includes(o.status))" :key="order.id" class="pos-order" @click="openOrderAtTable(order)"><div><b>#{{ order.orderNumber }} · {{ order.tableName }}</b><small>{{ order.itemCount }} món · {{ itemStatusNames[order.status] || order.status }}</small></div><strong>{{ new Intl.NumberFormat('vi-VN').format(order.total) }}đ</strong><span>Xem / thu tiền →</span></button></div><div class="panel-card printer-card"><h2>Máy in bill & két tiền</h2><form class="printer-form" @submit.prevent="savePrinterSettings"><input v-model="printerSettings.printerName" placeholder="Tên máy in trong Windows, ví dụ POS-80"><label><input v-model="printerSettings.autoPrint" type="checkbox"> Tự động in bill</label><label><input v-model="printerSettings.openCashDrawer" type="checkbox"> Mở két khi thu tiền</label><button class="new-order">Lưu cấu hình</button><button type="button" @click="testPrinter">In thử</button><button type="button" @click="openCashDrawer">Mở két thử</button></form></div></section>
