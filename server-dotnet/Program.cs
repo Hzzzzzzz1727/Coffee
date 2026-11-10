@@ -127,6 +127,9 @@ await using (var schemaConnection=new SqlConnection(coffeeConnection))
         foreach(var batch in Regex.Split(managementSql,@"^\s*GO\s*$",RegexOptions.Multiline|RegexOptions.IgnoreCase).Where(x=>!string.IsNullOrWhiteSpace(x)))
             await new SqlCommand(batch,schemaConnection).ExecuteNonQueryAsync();
     }
+    var areaNameMigrationPath=Path.Combine(AppContext.BaseDirectory,"migrations","006_fix_mojibake_area.sql");
+    if(File.Exists(areaNameMigrationPath))
+        await new SqlCommand(await File.ReadAllTextAsync(areaNameMigrationPath),schemaConnection).ExecuteNonQueryAsync();
 }
 await AuthFeatures.InitializeAsync(coffeeConnection);
 await LicenseFeatures.EnsureInstallation(coffeeConnection);
