@@ -4,18 +4,27 @@ internal static class DotEnvLoader
 {
     public static void Load()
     {
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var startDirectory in new[] { Directory.GetCurrentDirectory(), AppContext.BaseDirectory })
         {
             for (var directory = new DirectoryInfo(startDirectory); directory is not null; directory = directory.Parent)
             {
                 var path = Path.Combine(directory.FullName, ".env");
-                if (!File.Exists(path))
-                    continue;
-
-                LoadFile(path);
-                return;
+                if (File.Exists(path))
+                    paths.Add(path);
             }
         }
+
+        var commonData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+        if (!string.IsNullOrWhiteSpace(commonData))
+        {
+            var installPath = Path.Combine(commonData, "CoffeeOS", ".env");
+            if (File.Exists(installPath))
+                paths.Add(installPath);
+        }
+
+        foreach (var path in paths)
+            LoadFile(path);
     }
 
     private static void LoadFile(string path)
@@ -47,7 +56,7 @@ internal static class DotEnvLoader
         var applied = 0;
         foreach (var (key, value) in values)
         {
-            if (Environment.GetEnvironmentVariable(key) is not null)
+            if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(key)))
                 continue;
 
             Environment.SetEnvironmentVariable(key, value);

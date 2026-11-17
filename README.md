@@ -36,7 +36,7 @@ npm.cmd run server:dotnet
 
 Thay các giá trị ví dụ bằng thông tin của bạn. Chạy lệnh build một lần sau khi cập nhật mã hoặc dependency. Backend .NET tự đọc file `.env` ở thư mục chạy ứng dụng hoặc thư mục dự án gần nhất; giá trị môi trường Windows đã đặt sẽ được ưu tiên. Có thể tiếp tục dùng Windows Environment Variables thay cho `.env`.
 
-Các biến SMTP trong `.env` sẽ có hiệu lực sau khi khởi động lại API. Với Gmail, có thể dán App Password theo đúng định dạng chia nhóm có khoảng trắng; API tự bỏ khoảng trắng khỏi mật khẩu Gmail trước khi đăng nhập SMTP. Dùng thông tin SMTP thực tế của nhà cung cấp email; không để trống mật khẩu hoặc đưa `.env` lên Git/chia sẻ trong gói cài đặt. API tự tạo các bảng xác thực còn thiếu khi khởi động.
+Các biến SMTP trong `.env` sẽ có hiệu lực sau khi khởi động lại API. Với bản cài đặt trong `C:\ProgramData\CoffeeOS`, API đọc `.env` ngay trong thư mục đó; các biến Windows không rỗng được ưu tiên, còn biến để trống sẽ được nạp từ `.env`. Sau khi cài trên máy chủ trung tâm, có thể chạy `Configure-Smtp.ps1` trong gói cài đặt bằng PowerShell với quyền Administrator để nhập cấu hình, lưu an toàn và khởi động lại API. Chỉ cần cấu hình SMTP trên máy chủ; các máy khách gửi yêu cầu OTP qua API chung, không cần nhận hay lưu mật khẩu SMTP. Với Gmail, dùng App Password (không dùng mật khẩu Gmail thường); có thể dán theo định dạng chia nhóm có khoảng trắng vì API tự bỏ khoảng trắng trước khi gửi. Không đưa `.env` lên Git hoặc chia sẻ trong gói cài đặt. API tự tạo các bảng xác thực còn thiếu khi khởi động.
 
 ## Khởi chạy bản hiện tại
 
