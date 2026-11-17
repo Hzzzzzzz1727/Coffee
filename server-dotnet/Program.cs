@@ -287,7 +287,18 @@ app.MapGet("/api/orders/{id:guid}", async (Guid id) =>
 });
 app.MapPost("/api/orders/{id:guid}/request-bill", async (Guid id, ClaimsPrincipal user) =>
 {
-    var role=user.FindFirstValue(ClaimTypes.Role)??"";if(!new[]{"owner","manager","server"}.Contains(role))return Results.Json(new{error="Chỉ phục vụ hoặc quản lý được gửi yêu cầu in bill."},statusCode:403);await using var connection=new SqlConnection(coffeeConnection);await connection.OpenAsync();await using var command=new SqlCommand("UPDATE dbo.Orders SET BillRequestedAt=COALESCE(BillRequestedAt,SYSUTCDATETIME()) OUTPUT INSERTED.BillRequestedAt WHERE Id=@id AND Status NOT IN ('paid','cancelled')",connection);command.Parameters.AddWithValue("@id",id);var requestedAt=await command.ExecuteScalarAsync();if(requestedAt is not DateTime time)return Results.NotFound(new{error="Đơn không còn hoạt động."});var printError=await ReceiptPrinter.TryAutoPrint(coffeeConnection,id);return Results.Ok(new{id,billRequestedAt=time,printError});
+    var role=user.FindFirstValue(ClaimTypes.Role)??"";
+    if(!new[]{"owner","manager","server"}.Contains(role))return Results.Json(new{error="Chỉ phục vụ hoặc quản lý được gửi yêu cầu in bill."},statusCode:403);
+    await using var connection=new SqlConnection(coffeeConnection);await connection.OpenAsync();
+    await using var transaction=await connection.BeginTransactionAsync();
+    await using var update=new SqlCommand("UPDATE dbo.Orders SET BillRequestedAt=COALESCE(BillRequestedAt,SYSUTCDATETIME()) WHERE Id=@id AND Status NOT IN ('paid','cancelled')",connection,(SqlTransaction)transaction);update.Parameters.AddWithValue("@id",id);
+    if(await update.ExecuteNonQueryAsync()==0){await transaction.RollbackAsync();return Results.NotFound(new{error="Đơn không còn hoạt động."});}
+    await using var read=new SqlCommand("SELECT BillRequestedAt FROM dbo.Orders WHERE Id=@id",connection,(SqlTransaction)transaction);read.Parameters.AddWithValue("@id",id);
+    var requestedAt=await read.ExecuteScalarAsync();
+    if(requestedAt is not DateTime time){await transaction.RollbackAsync();return Results.Problem("Không thể ghi nhận thời điểm yêu cầu in bill.");}
+    await transaction.CommitAsync();
+    var printError=await ReceiptPrinter.TryAutoPrint(coffeeConnection,id);
+    return Results.Ok(new{id,billRequestedAt=time,printError});
 });
 app.MapDelete("/api/order-items/{id:guid}", async (Guid id, ClaimsPrincipal user) =>
 {

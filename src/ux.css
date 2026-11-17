@@ -202,8 +202,20 @@ input, select, textarea { accent-color: var(--coffee-leaf); }
 .service-heading { background: linear-gradient(120deg,#e8f0ea,#f5efe4); border-color: #cddcd2; box-shadow: var(--shadow-soft); }
 .service-table-grid button { min-height: 126px; border-radius: 13px; box-shadow: 0 5px 16px rgba(36,70,56,.06); }
 .history-row, .data-row, .inventory-row { min-height: 58px; }
-.modal-backdrop { backdrop-filter: blur(7px); }
+body:has(.modal-backdrop) { overflow: hidden; }
+.modal-backdrop {
+  z-index: 100;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  backdrop-filter: blur(7px);
+}
 .order-modal, .picker-modal, .kds-detail-modal { border: 1px solid rgba(255,255,255,.65); border-radius: 20px; box-shadow: var(--shadow-raised); }
+.order-modal {
+  width: min(960px,calc(100vw - 40px));
+  max-height: calc(100dvh - 40px);
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
 .close { min-width: 36px; min-height: 36px; cursor: pointer; }
 .toast { right: 24px; bottom: 24px; max-width: min(420px,calc(100vw - 32px)); border-radius: 12px; font-weight: 700; }
 

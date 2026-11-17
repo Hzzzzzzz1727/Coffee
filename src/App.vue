@@ -241,11 +241,12 @@ async function api(path, options = {}) {
 }
 async function loadData() {
   const canReport = ['owner','manager','cashier'].includes(currentUser.value?.role)
-  const [tableResult, menuResult, toppingResult, kdsResult, settingsResult, historyResult, reportResult, areaResult] = await Promise.allSettled([api('/tables'), api('/products'), api('/toppings'), api('/orders/kds'), api('/payment-settings'), api('/orders'), canReport ? api('/reports/summary') : Promise.resolve({ revenue:0, paidOrders:0, cancelledOrders:0 }),api('/areas')])
+  const canLoadPaymentSettings = ['owner','manager','cashier'].includes(currentUser.value?.role)
+  const [tableResult, menuResult, toppingResult, kdsResult, settingsResult, historyResult, reportResult, areaResult] = await Promise.allSettled([api('/tables'), api('/products'), api('/toppings'), api('/orders/kds'), canLoadPaymentSettings ? api('/payment-settings') : Promise.resolve(null), api('/orders'), canReport ? api('/reports/summary') : Promise.resolve({ revenue:0, paidOrders:0, cancelledOrders:0 }),api('/areas')])
   const failedAuth = [tableResult,menuResult,toppingResult,kdsResult,settingsResult,historyResult,reportResult,areaResult].find(result => result.status === 'rejected' && result.reason?.status === 401)
   if (failedAuth) throw failedAuth.reason
   // Không để nhịp đồng bộ 2 giây ghi đè nội dung quản lý đang nhập.
-  if (settingsResult.status === 'fulfilled' && !paymentSettingsEditing.value) paymentSettings.value = settingsResult.value
+  if (settingsResult.status === 'fulfilled' && settingsResult.value && !paymentSettingsEditing.value) paymentSettings.value = settingsResult.value
   if (historyResult.status === 'fulfilled') {
     allOrders.value = historyResult.value
     const requestedNow=new Set(allOrders.value.filter(o=>o.billRequestedAt&&!['paid','cancelled'].includes(o.status)).map(o=>o.id))
