@@ -8,13 +8,14 @@ COFFEE OS - HUONG DAN CAI DAT
 6. Mo http://localhost:3032 tren may chu.
 7. May khac cung Wi-Fi mo http://IP-MAY-CHU:3032.
 
-Gui email dat lai mat khau can cau hinh SMTP tren may chu:
-- Tao file .env trong thu muc cai dat CoffeeOS voi cac bien COFFEE_SMTP_HOST,
-  COFFEE_SMTP_PORT, COFFEE_SMTP_USER, COFFEE_SMTP_PASSWORD va COFFEE_SMTP_FROM.
-- Co the dung Windows System Environment Variables thay cho .env; gia tri Windows duoc uu tien.
-- Dung thong tin SMTP cua nha cung cap email (Gmail can App Password, khong dung mat khau Gmail thuong).
-- App Password Gmail co the dan theo dang chia nhom co khoang trang; API tu bo khoang trang truoc khi gui.
-- Khoi dong lai CoffeeOS sau khi thay doi. Khong dua file .env chua mat khau vao Git hoac chia se.
+Gui email dat lai mat khau chi can cau hinh SMTP mot lan tren may chu trung tam:
+- Cai CoffeeOS tren may chu, giai nen goi phat hanh va mo PowerShell bang Run as administrator.
+- Chay: powershell -ExecutionPolicy Bypass -File .\Configure-Smtp.ps1
+- Nhap SMTP host, port, tai khoan, email gui va mat khau ung dung. Gmail can App Password, khong dung mat khau Gmail thuong.
+- Cong cu luu cau hinh vao C:\ProgramData\CoffeeOS\.env, gioi han quyen truy cap file va khoi dong lai API.
+- Cac may khach truy cap http://IP-MAY-CHU:3032; khong can cai SMTP hay sao chep mat khau sang may khach.
+- Neu sua thu cong, App Password Gmail co the dan theo dang chia nhom co khoang trang; API tu bo khoang trang truoc khi gui.
+- Khong dua file .env chua mat khau vao Git hoac chia se trong goi cai dat.
 
 Tu dang ky tai khoan (mac dinh tat):
 - De bat, them COFFEE_ALLOW_REGISTRATION=true vao .env hoac Windows System Environment Variables va khoi dong lai CoffeeOS.

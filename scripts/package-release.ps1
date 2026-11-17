@@ -22,6 +22,7 @@ try {
 finally { Pop-Location }
 
 Copy-Item -LiteralPath (Join-Path $projectRoot 'deployment/Install-CoffeeOS.ps1') -Destination $packageRoot
+Copy-Item -LiteralPath (Join-Path $projectRoot 'deployment/Configure-Smtp.ps1') -Destination $packageRoot
 Copy-Item -LiteralPath (Join-Path $projectRoot 'deployment/README-CUSTOMER.txt') -Destination $packageRoot
 $zipPath = Join-Path $releaseRoot 'CoffeeOS-Windows-x64.zip'
 if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
